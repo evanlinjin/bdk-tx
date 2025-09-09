@@ -246,13 +246,13 @@ impl Wallet {
             .script_pubkey();
         let output_script = ScriptSource::from_script(script_pubkey);
 
-        let cpfp_params = CpfpParams::new(
+        let cpfp_params = CpfpParams {
             package_fee,
             package_weight,
             inputs,
             target_package_feerate,
             output_script,
-        );
+        };
 
         let selection = cpfp_params.into_selection()?;
         Ok(selection)

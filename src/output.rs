@@ -75,6 +75,14 @@ impl From<(DefiniteDescriptor, Amount)> for Output {
 }
 
 impl Output {
+    /// Construct [`Output`]
+    pub fn new(source: impl Into<ScriptSource>, value: Amount) -> Self {
+        Self {
+            value,
+            script_pubkey_source: source.into(),
+        }
+    }
+
     /// From script
     pub fn with_script(script: ScriptBuf, value: Amount) -> Self {
         Self {
