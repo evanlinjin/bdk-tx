@@ -93,11 +93,11 @@ fn main() -> anyhow::Result<()> {
         let selection_inputs = selection.inputs.clone();
 
         let psbt = selection.create_psbt(PsbtParams {
-            enable_anti_fee_sniping: true,
             fallback_locktime,
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         })?;
+        let psbt = selection.apply_anti_fee_sniping(psbt, tip_height, &mut rand::thread_rng())?;
 
         let tx = psbt.unsigned_tx;
 
