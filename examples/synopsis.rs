@@ -1,9 +1,9 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
-    SelectorParams, Signer,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
+    SelectorParams, Signer, TemplateParams,
 };
-use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
+use bitcoin::{key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
 
 mod common;
@@ -68,11 +68,9 @@ fn main() -> anyhow::Result<()> {
             },
         )?;
 
-    let mut psbt = selection.create_psbt(PsbtParams {
-        fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-        ..Default::default()
-    })?;
-    let finalizer = selection.into_finalizer();
+    let template = selection.into_template(TemplateParams::default());
+    let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+    let finalizer = template.into_finalizer();
 
     let _ = psbt.sign(&signer, &secp);
     let res = finalizer.finalize(&mut psbt);
@@ -149,11 +147,6 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let mut psbt = selection.create_psbt(PsbtParams {
-            // Not strictly necessary, but it may help us replace the tx faster.
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            ..Default::default()
-        })?;
         println!(
             "selected inputs: {:?}",
             selection
@@ -163,7 +156,9 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
         );
 
-        let finalizer = selection.into_finalizer();
+        let template = selection.into_template(TemplateParams::default());
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+        let finalizer = template.into_finalizer();
         psbt.sign(&signer, &secp).expect("failed to sign");
         assert!(
             finalizer.finalize(&mut psbt).is_finalized(),

@@ -19,6 +19,7 @@ mod rbf;
 mod selection;
 mod selector;
 mod signer;
+mod template;
 
 pub use anti_fee_sniping::AntiFeeSnipingError;
 pub use canonical_unspents::*;
@@ -33,6 +34,7 @@ pub use rbf::*;
 pub use selection::*;
 pub use selector::*;
 pub use signer::*;
+pub use template::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {

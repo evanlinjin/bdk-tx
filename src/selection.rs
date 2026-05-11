@@ -1,21 +1,8 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::fmt::{Debug, Display};
 
-use miniscript::bitcoin;
-use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
-use miniscript::psbt::PsbtExt;
+use miniscript::bitcoin::absolute;
 
 use crate::{Finalizer, Input, Output};
-
-/// Default sequence value used for plan-based inputs that don't specify their own.
-///
-/// Matches Bitcoin Core's wallet default (`MAX_BIP125_RBF_SEQUENCE = 0xfffffffd`):
-/// BIP125-signaling and lock_time-respecting. With Bitcoin Core 28+ defaulting
-/// to Full RBF, the BIP125 signal is no longer load-bearing for replaceability,
-/// but signaling explicitly is what virtually every modern wallet does and what
-/// downstream tooling (block explorers, fee-bumping UIs) gates on.
-const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
 
 /// Final selection of inputs and outputs.
 ///
@@ -23,11 +10,12 @@ const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_RBF_NO_LO
 /// validation performed by [`Selector::new`] (notably the locktime-unit
 /// consistency check). All publicly-reachable code paths that produce a
 /// `Selection` route through [`Selector`], so downstream stages
-/// ([`Selection::create_psbt`], [`Selection::apply_anti_fee_sniping`]) can
-/// rely on those invariants.
+/// ([`Selection::into_template`], [`crate::TxTemplate::into_psbt`]) can rely
+/// on those invariants.
 ///
 /// [`Selector`]: crate::Selector
 /// [`Selector::new`]: crate::Selector::new
+/// [`Selection::into_template`]: crate::Selection::into_template
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -37,109 +25,20 @@ pub struct Selection {
     pub outputs: Vec<Output>,
 }
 
-/// Parameters for creating a psbt.
-#[derive(Debug, Clone)]
-pub struct PsbtParams {
-    /// Minimum tx version.
-    ///
-    /// Acts as a floor on `tx.version`: [`Selection::create_psbt`] bumps it
-    /// up to `Version::TWO` if any input requires CSV (`relative_timelock`),
-    /// and [`Selection::apply_anti_fee_sniping`] bumps it when it picks the
-    /// sequence branch (which needs BIP68 semantics).
-    ///
-    /// Default: [`transaction::Version::TWO`] — what modern wallets want.
-    /// Set to [`transaction::Version::ONE`] if you want the construction to
-    /// stay at v1 *unless* something forces it higher.
-    pub min_version: transaction::Version,
-
-    /// Minimum tx locktime.
-    ///
-    /// Acts as a floor on `tx.lock_time`: the value used when no input
-    /// specifies a required absolute locktime, or when all input-required
-    /// CLTVs (of the same unit as this field) are below it. A different-unit
-    /// fallback is ignored so that e.g. a height-based default does not
-    /// conflict with a time-based CLTV requirement.
-    ///
-    /// Default: [`absolute::LockTime::ZERO`]. Also the channel through which
-    /// [`Selection::apply_anti_fee_sniping`] writes its locktime signal.
-    pub min_locktime: absolute::LockTime,
-
-    /// [`Sequence`] value to use by default if not provided by the input.
-    ///
-    /// Defaults to [`Sequence::ENABLE_RBF_NO_LOCKTIME`] (0xfffffffd) to match
-    /// Bitcoin Core's wallet default (`MAX_BIP125_RBF_SEQUENCE`): BIP125-
-    /// signaling, lock_time-respecting. This is what callers almost always
-    /// want in 2026.
-    pub fallback_sequence: Sequence,
-
-    /// Whether to require the full tx, aka [`non_witness_utxo`] for segwit v0 inputs,
-    /// default is `true`.
-    ///
-    /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
-    pub mandate_full_tx_for_segwit_v0: bool,
-}
-
-impl Default for PsbtParams {
-    fn default() -> Self {
-        Self {
-            min_version: transaction::Version::TWO,
-            min_locktime: absolute::LockTime::ZERO,
-            fallback_sequence: FALLBACK_SEQUENCE,
-            mandate_full_tx_for_segwit_v0: true,
-        }
-    }
-}
-
-/// Occurs when creating a psbt fails.
-#[derive(Debug)]
-pub enum CreatePsbtError {
-    /// Missing tx for legacy input.
-    MissingFullTxForLegacyInput(Box<Input>),
-    /// Missing tx for segwit v0 input.
-    MissingFullTxForSegwitV0Input(Box<Input>),
-    /// Psbt error.
-    Psbt(bitcoin::psbt::Error),
-    /// Update psbt output with descriptor error.
-    OutputUpdate(miniscript::psbt::OutputUpdateError),
-}
-
-impl core::fmt::Display for CreatePsbtError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
-                f,
-                "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
-            ),
-            CreatePsbtError::MissingFullTxForSegwitV0Input(input) => write!(
-                f,
-                "segwit v0 input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
-            ),
-            CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
-            CreatePsbtError::OutputUpdate(output_update_error) => {
-                Display::fmt(&output_update_error, f)
-            }
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for CreatePsbtError {}
-
 impl Selection {
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
-    /// Returns the `min_locktime` if the locktimes iterator is empty, or the maximum
-    /// locktime if all items share the same unit. A different-unit fallback is intentionally
-    /// ignored so that e.g. a height-based fallback does not conflict with a time-based CLTV
-    /// requirement.
+    /// Returns the `min_locktime` if the locktimes iterator is empty, or the
+    /// maximum locktime if all items share the same unit. A different-unit
+    /// fallback is intentionally ignored so that e.g. a height-based fallback
+    /// does not conflict with a time-based CLTV requirement.
     ///
     /// # Panics
     ///
-    /// Debug-panics if the iterator yields locktimes of mixed units. This invariant is
-    /// enforced upstream by [`Selector::new`][sel]; reaching this panic means a `Selection`
-    /// was constructed by some path that bypassed validation.
+    /// Debug-panics if the iterator yields locktimes of mixed units. This
+    /// invariant is enforced upstream by [`Selector::new`][sel]; reaching
+    /// this panic means a `Selection` was constructed by some path that
+    /// bypassed validation.
     ///
     /// [sel]: crate::Selector::new
     pub(crate) fn accumulate_max_locktime(
@@ -162,9 +61,7 @@ impl Selection {
             };
         }
         match acc {
-            // No required locktimes from inputs: use fallback directly.
             None => min_locktime,
-            // Same unit as fallback: take the maximum of required and fallback.
             Some(lock_time) if lock_time.is_same_unit(min_locktime) => {
                 if lock_time.is_implied_by(min_locktime) {
                     min_locktime
@@ -172,91 +69,8 @@ impl Selection {
                     lock_time
                 }
             }
-            // Fallback is a different unit: use required locktime and ignore fallback.
             Some(lock_time) => lock_time,
         }
-    }
-
-    /// Create PSBT.
-    pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        // Bump tx.version above params.min_version if any input requires CSV
-        // semantics (BIP112). Without v2+, the script's CSV opcode fails.
-        let inputs_require_v2 = self
-            .inputs
-            .iter()
-            .any(|input| input.relative_timelock().is_some());
-        let tx_version = if inputs_require_v2 {
-            params.min_version.max(transaction::Version::TWO)
-        } else {
-            params.min_version
-        };
-        let tx = bitcoin::Transaction {
-            version: tx_version,
-            lock_time: Self::accumulate_max_locktime(
-                self.inputs
-                    .iter()
-                    .filter_map(|input| input.absolute_timelock()),
-                params.min_locktime,
-            ),
-            input: self
-                .inputs
-                .iter()
-                .map(|input| bitcoin::TxIn {
-                    previous_output: input.prev_outpoint(),
-                    sequence: input.sequence().unwrap_or(params.fallback_sequence),
-                    ..Default::default()
-                })
-                .collect(),
-            output: self.outputs.iter().map(|output| output.txout()).collect(),
-        };
-
-        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
-
-        for (plan_input, psbt_input) in self.inputs.iter().zip(psbt.inputs.iter_mut()) {
-            if let Some(finalized_psbt_input) = plan_input.psbt_input() {
-                *psbt_input = finalized_psbt_input.clone();
-                continue;
-            }
-            if let Some(plan) = plan_input.plan() {
-                plan.update_psbt_input(psbt_input);
-
-                let witness_version = plan.witness_version();
-                if witness_version.is_some() {
-                    psbt_input.witness_utxo = Some(plan_input.prev_txout().clone());
-                }
-                // We are allowed to have full tx for segwit inputs. Might as well include it.
-                // If the caller does not wish to include the full tx in Segwit V0 inputs, they should not
-                // include it in `crate::Input`.
-                psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
-                if psbt_input.non_witness_utxo.is_none() {
-                    if witness_version.is_none() {
-                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(Box::new(
-                            plan_input.clone(),
-                        )));
-                    }
-                    if params.mandate_full_tx_for_segwit_v0
-                        && witness_version == Some(bitcoin::WitnessVersion::V0)
-                    {
-                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(Box::new(
-                            plan_input.clone(),
-                        )));
-                    }
-                }
-
-                psbt_input.sighash_type = plan_input.sighash_type();
-
-                continue;
-            }
-            unreachable!("input candidate must either have finalized psbt input or plan");
-        }
-        for (output_index, output) in self.outputs.iter().enumerate() {
-            if let Some(desc) = output.descriptor() {
-                psbt.update_output_with_descriptor(output_index, desc)
-                    .map_err(CreatePsbtError::OutputUpdate)?;
-            }
-        }
-
-        Ok(psbt)
     }
 
     /// Into psbt finalizer.
@@ -273,10 +87,10 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PsbtBuildParams, TemplateParams};
     use bitcoin::{
-        absolute::{self, LockTime},
-        secp256k1::Secp256k1,
-        transaction, Amount, ScriptBuf, Transaction, TxIn, TxOut,
+        absolute::LockTime, secp256k1::Secp256k1, transaction, Amount, ScriptBuf, Transaction,
+        TxIn, TxOut,
     };
     use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
 
@@ -304,29 +118,21 @@ mod tests {
         };
         let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
-                desc.at_derivation_index(1)?,
-                Amount::from_sat(1000),
-            )],
-        };
-
         struct TestCase {
             name: &'static str,
-            psbt_params: PsbtParams,
+            params: TemplateParams,
             exp_locktime: u32,
         }
 
         let cases = vec![
             TestCase {
                 name: "no fallback locktime, use plan locktime",
-                psbt_params: PsbtParams::default(),
+                params: TemplateParams::default(),
                 exp_locktime: 100_000,
             },
             TestCase {
                 name: "larger fallback locktime is used",
-                psbt_params: PsbtParams {
+                params: TemplateParams {
                     min_locktime: absolute::LockTime::from_consensus(100_100),
                     ..Default::default()
                 },
@@ -334,7 +140,7 @@ mod tests {
             },
             TestCase {
                 name: "smaller fallback locktime is ignored",
-                psbt_params: PsbtParams {
+                params: TemplateParams {
                     min_locktime: absolute::LockTime::from_consensus(99_900),
                     ..Default::default()
                 },
@@ -343,7 +149,16 @@ mod tests {
         ];
 
         for test in cases {
-            let psbt = selection.create_psbt(test.psbt_params)?;
+            let selection = Selection {
+                inputs: vec![input.clone()],
+                outputs: vec![Output::with_descriptor(
+                    desc.at_derivation_index(1)?,
+                    Amount::from_sat(1000),
+                )],
+            };
+            let psbt = selection
+                .into_template(test.params)
+                .create_psbt(PsbtBuildParams::default())?;
             assert_eq!(
                 psbt.unsigned_tx.lock_time.to_consensus_u32(),
                 test.exp_locktime,
@@ -382,17 +197,18 @@ mod tests {
         };
         let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
 
+        // Default fallback is height 0 (block-height unit). It is incompatible with the
+        // time-based CLTV requirement, so it must be ignored.
         let selection = Selection {
-            inputs: vec![input],
+            inputs: vec![input.clone()],
             outputs: vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
         };
-
-        // Default fallback is height 0 (block-height unit). It is incompatible with the
-        // time-based CLTV requirement, so it must be ignored.
-        let psbt = selection.create_psbt(PsbtParams::default())?;
+        let psbt = selection
+            .into_template(TemplateParams::default())
+            .create_psbt(PsbtBuildParams::default())?;
         assert_eq!(
             psbt.unsigned_tx.lock_time, time_locktime,
             "time-based CLTV requirement should be used; height-based fallback must be ignored",
@@ -401,10 +217,19 @@ mod tests {
         // An explicit time-based fallback *greater* than the requirement should be respected.
         let larger_time = absolute::LockTime::from_consensus(1_772_167_108);
         assert!(larger_time > time_locktime);
-        let psbt = selection.create_psbt(PsbtParams {
-            min_locktime: larger_time,
-            ..Default::default()
-        })?;
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        };
+        let psbt = selection
+            .into_template(TemplateParams {
+                min_locktime: larger_time,
+                ..Default::default()
+            })
+            .create_psbt(PsbtBuildParams::default())?;
         assert_eq!(
             psbt.unsigned_tx.lock_time, larger_time,
             "a larger time-based fallback should override the CLTV requirement",
@@ -414,8 +239,8 @@ mod tests {
     }
 
     #[test]
-    fn test_create_psbt_does_not_apply_afs() -> anyhow::Result<()> {
-        // `create_psbt` is now AFS-free: lock_time matches `min_locktime`
+    fn test_into_template_does_not_apply_afs() -> anyhow::Result<()> {
+        // `into_template` is AFS-free: lock_time matches `min_locktime`
         // when no input requires a CLTV.
         let secp = Secp256k1::new();
         let desc =
@@ -452,11 +277,12 @@ mod tests {
             outputs: vec![output],
         };
 
-        let psbt = selection.create_psbt(PsbtParams {
-            min_locktime: LockTime::from_consensus(current_height),
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            ..Default::default()
-        })?;
+        let psbt = selection
+            .into_template(TemplateParams {
+                min_locktime: LockTime::from_consensus(current_height),
+                ..Default::default()
+            })
+            .create_psbt(PsbtBuildParams::default())?;
         assert_eq!(
             psbt.unsigned_tx.lock_time.to_consensus_u32(),
             current_height

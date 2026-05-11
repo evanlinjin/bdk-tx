@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
-    SelectorParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
+    SelectorParams, TemplateParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
@@ -88,11 +88,11 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let mut params = PsbtParams::default();
         let selection_inputs = selection.inputs.clone();
         let psbt = selection
-            .apply_anti_fee_sniping(&mut params, tip_height, &mut rand::thread_rng())?
-            .create_psbt(params)?;
+            .into_template(TemplateParams::default())
+            .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
+            .create_psbt(PsbtBuildParams::default())?;
 
         let tx = psbt.unsigned_tx;
 

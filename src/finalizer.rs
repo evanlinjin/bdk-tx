@@ -23,26 +23,23 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// # use bdk_tx::PsbtParams;
-/// # let secp = bitcoin::secp256k1::Secp256k1::new();
-/// # let keymap = std::collections::BTreeMap::new();
-/// # let selection = bdk_tx::Selection { inputs: vec![], outputs: vec![] };
-/// // Create PSBT from a selection of inputs and outputs.
-/// let mut psbt = selection.create_psbt(PsbtParams::default())?;
+/// ```ignore
+/// // Build a template from the selection, then create the PSBT and finalizer
+/// // from the same template.
+/// let template = selection.into_template(TemplateParams::default());
+/// let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+/// let finalizer = template.into_finalizer();
 ///
 /// // Sign the PSBT using your preferred method.
 /// let signer = bdk_tx::Signer(keymap);
 /// let _ = psbt.sign(&signer, &secp);
 ///
 /// // Finalize the PSBT.
-/// let finalizer = selection.into_finalizer();
 /// let finalize_map = finalizer.finalize(&mut psbt);
 /// assert!(finalize_map.is_finalized());
 ///
 /// // Extract the final transaction.
 /// let tx = psbt.extract_tx()?;
-/// # Ok::<_, anyhow::Error>(())
 /// ```
 ///
 /// [BIP174]: <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer>
@@ -165,7 +162,7 @@ impl FinalizeMap {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use crate::{Finalizer, Output, PsbtParams, Selection, Signer};
+    use crate::{Finalizer, Output, PsbtBuildParams, Selection, Signer, TemplateParams};
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn, TxOut};
     use miniscript::bitcoin;
@@ -222,8 +219,9 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let template = selection.into_template(TemplateParams::default());
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+        let finalizer = template.into_finalizer();
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
@@ -245,8 +243,9 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let template = selection.into_template(TemplateParams::default());
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+        let finalizer = template.into_finalizer();
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
@@ -274,8 +273,9 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let template = selection.into_template(TemplateParams::default());
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+        let finalizer = template.into_finalizer();
 
         assert!(!psbt.outputs[0].tap_key_origins.is_empty());
         assert!(psbt.outputs[0].tap_internal_key.is_some());
@@ -329,7 +329,9 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let template = selection.into_template(TemplateParams::default());
+
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
         let tap_internal_key = psbt.outputs[0].tap_internal_key;
@@ -369,8 +371,9 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let template = selection.into_template(TemplateParams::default());
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+        let finalizer = template.into_finalizer();
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
         let tap_internal_key = psbt.outputs[0].tap_internal_key;
@@ -400,8 +403,9 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let template = selection.into_template(TemplateParams::default());
+        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
+        let finalizer = template.into_finalizer();
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
