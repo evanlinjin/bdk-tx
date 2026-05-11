@@ -47,7 +47,7 @@ impl Selection {
     /// that the transaction is fresh. The function chooses one of two
     /// approaches:
     ///
-    /// - **nLockTime**: rewrites `params.fallback_locktime` to approximately
+    /// - **nLockTime**: rewrites `params.min_locktime` to approximately
     ///   `tip_height`.
     /// - **nSequence**: overrides one randomly chosen Taproot input's
     ///   sequence to approximately its confirmation depth (via
@@ -64,9 +64,9 @@ impl Selection {
     ///   `params.version` is below `Version::TWO`, AFS forces the locktime
     ///   branch; `params.version` is **not** modified.
     /// - If the transaction's effective locktime (the value [`create_psbt`]
-    ///   would produce from `params.fallback_locktime` and any input-required
+    ///   would produce from `params.min_locktime` and any input-required
     ///   CLTVs) is **time-based**, the locktime branch can't apply — AFS's
-    ///   height-based write to `params.fallback_locktime` would be silently
+    ///   height-based write to `params.min_locktime` would be silently
     ///   dropped by [`accumulate_max_locktime`][acc]. In that case AFS forces
     ///   the sequence branch. If the sequence branch is also ineligible
     ///   (non-taproot input, unconfirmed input, RBF disabled, etc.), AFS
@@ -99,7 +99,7 @@ impl Selection {
     /// ```
     ///
     /// `params` is borrowed mutably because AFS reads other fields
-    /// (`version`, `fallback_sequence`, `fallback_locktime`) to decide which
+    /// (`version`, `fallback_sequence`, `min_locktime`) to decide which
     /// branch to take; the caller's choices on those fields must be set
     /// before calling AFS so its decisions stay consistent with them.
     ///
@@ -122,7 +122,7 @@ impl Selection {
         // Compute the effective locktime that create_psbt would produce.
         let effective_locktime = Selection::accumulate_max_locktime(
             self.inputs.iter().filter_map(|i| i.absolute_timelock()),
-            params.fallback_locktime,
+            params.min_locktime,
         );
 
         // The locktime branch can only write a height-based value; a
@@ -206,8 +206,7 @@ impl Selection {
             // Never write below the effective locktime — preserves CLTV.
             locktime = locktime.max(effective_height.to_consensus_u32());
 
-            params.fallback_locktime =
-                LockTime::from_height(locktime).expect("must be valid Height");
+            params.min_locktime = LockTime::from_height(locktime).expect("must be valid Height");
         } else {
             let random_index = random_range(rng, taproot_inputs.len() as u32);
             let input_index = taproot_inputs[random_index as usize];
@@ -311,7 +310,7 @@ mod tests {
                 outputs: vec![output],
             };
             let mut params = PsbtParams {
-                fallback_locktime: LockTime::ZERO,
+                min_locktime: LockTime::ZERO,
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
@@ -328,8 +327,8 @@ mod tests {
                 assert!((min_height..=current_height).contains(&locktime_value));
                 assert_eq!(
                     locktime_value,
-                    params.fallback_locktime.to_consensus_u32(),
-                    "create_psbt should preserve the AFS-set fallback_locktime when no input requires a higher CLTV"
+                    params.min_locktime.to_consensus_u32(),
+                    "create_psbt should preserve the AFS-set min_locktime when no input requires a higher CLTV"
                 );
             } else {
                 used_sequence = true;
@@ -373,7 +372,7 @@ mod tests {
                 outputs: vec![output.clone()],
             };
             let mut params = PsbtParams {
-                fallback_locktime: LockTime::ZERO,
+                min_locktime: LockTime::ZERO,
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
@@ -418,7 +417,7 @@ mod tests {
             };
             let mut params = PsbtParams {
                 version: Version::ONE,
-                fallback_locktime: LockTime::ZERO,
+                min_locktime: LockTime::ZERO,
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
@@ -431,7 +430,7 @@ mod tests {
                 "params.version must not be silently mutated"
             );
             assert!(
-                params.fallback_locktime > LockTime::ZERO,
+                params.min_locktime > LockTime::ZERO,
                 "AFS should have taken the locktime branch at v1"
             );
             assert_eq!(
@@ -457,7 +456,7 @@ mod tests {
                 outputs: vec![],
             };
             let mut params = PsbtParams {
-                fallback_locktime: time_locktime,
+                min_locktime: time_locktime,
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
@@ -466,7 +465,7 @@ mod tests {
                 .expect("AFS should force sequence branch when effective locktime is time-based");
 
             // Time-based fallback must NOT be rewritten by AFS.
-            assert_eq!(params.fallback_locktime, time_locktime);
+            assert_eq!(params.min_locktime, time_locktime);
             // The chosen taproot input should have its sequence overridden.
             let seq = selection.inputs[0]
                 .sequence()
@@ -511,7 +510,7 @@ mod tests {
         };
         let time_locktime = LockTime::from_consensus(1_734_230_218);
         let mut params = PsbtParams {
-            fallback_locktime: time_locktime,
+            min_locktime: time_locktime,
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         };
@@ -540,7 +539,7 @@ mod tests {
         };
         let existing = Height::from_consensus(800_060).unwrap();
         let mut params = PsbtParams {
-            fallback_locktime: LockTime::Blocks(existing),
+            min_locktime: LockTime::Blocks(existing),
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         };
@@ -550,14 +549,14 @@ mod tests {
             .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
             .expect("AFS should accept effective locktime above tip");
 
-        // The clamp inside AFS ensures params.fallback_locktime ends up at
+        // The clamp inside AFS ensures params.min_locktime ends up at
         // least the existing height.
-        assert!(params.fallback_locktime.to_consensus_u32() >= existing.to_consensus_u32());
+        assert!(params.min_locktime.to_consensus_u32() >= existing.to_consensus_u32());
     }
 
     #[test]
     fn test_anti_fee_sniping_locktime_clamp_preserves_input_cltv() {
-        // params.fallback_locktime is at exactly tip - 50: any random offset
+        // params.min_locktime is at exactly tip - 50: any random offset
         // >= 50 would underflow it. Across many iterations, AFS must never
         // write below the effective locktime.
         let tip = 1_000_000u32;
@@ -572,7 +571,7 @@ mod tests {
                 outputs: vec![],
             };
             let mut params = PsbtParams {
-                fallback_locktime: LockTime::from_height(existing).unwrap(),
+                min_locktime: LockTime::from_height(existing).unwrap(),
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
@@ -580,14 +579,14 @@ mod tests {
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             // Existing > 0 forces the locktime branch.
-            assert!(params.fallback_locktime > LockTime::ZERO);
+            assert!(params.min_locktime > LockTime::ZERO);
             assert!(
-                params.fallback_locktime.to_consensus_u32() >= existing,
+                params.min_locktime.to_consensus_u32() >= existing,
                 "AFS wrote {} below existing CLTV {}",
-                params.fallback_locktime.to_consensus_u32(),
+                params.min_locktime.to_consensus_u32(),
                 existing,
             );
-            assert!(params.fallback_locktime.to_consensus_u32() <= tip);
+            assert!(params.min_locktime.to_consensus_u32() <= tip);
             // No input sequence override should have been set.
             assert!(selection.inputs[0].sequence().is_none());
         }
@@ -611,11 +610,11 @@ mod tests {
                 )],
             };
             let mut params = PsbtParams {
-                fallback_locktime: LockTime::ZERO,
+                min_locktime: LockTime::ZERO,
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            let original_lt = params.fallback_locktime;
+            let original_lt = params.min_locktime;
             let original_seq = selection.inputs[0].sequence();
 
             let selection = selection
@@ -623,7 +622,7 @@ mod tests {
                 .unwrap();
 
             let new_seq = selection.inputs[0].sequence();
-            if params.fallback_locktime != original_lt || new_seq != original_seq {
+            if params.min_locktime != original_lt || new_seq != original_seq {
                 at_least_one_change = true;
                 break;
             }
@@ -682,7 +681,7 @@ mod tests {
                 )],
             };
             let mut params = PsbtParams {
-                fallback_locktime: LockTime::ZERO,
+                min_locktime: LockTime::ZERO,
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
@@ -690,7 +689,7 @@ mod tests {
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             assert!(
-                params.fallback_locktime > LockTime::ZERO,
+                params.min_locktime > LockTime::ZERO,
                 "AFS should take the locktime branch when the only taproot input has a relative timelock"
             );
             assert_eq!(

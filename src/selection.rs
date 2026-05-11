@@ -43,10 +43,17 @@ pub struct PsbtParams {
     /// Use a specific [`transaction::Version`].
     pub version: transaction::Version,
 
-    /// Fallback tx locktime.
+    /// Minimum tx locktime.
     ///
-    /// The locktime to use if no input specifies a required absolute locktime.
-    pub fallback_locktime: absolute::LockTime,
+    /// Acts as a floor on `tx.lock_time`: the value used when no input
+    /// specifies a required absolute locktime, or when all input-required
+    /// CLTVs (of the same unit as this field) are below it. A different-unit
+    /// fallback is ignored so that e.g. a height-based default does not
+    /// conflict with a time-based CLTV requirement.
+    ///
+    /// Default: [`absolute::LockTime::ZERO`]. Also the channel through which
+    /// [`Selection::apply_anti_fee_sniping`] writes its locktime signal.
+    pub min_locktime: absolute::LockTime,
 
     /// [`Sequence`] value to use by default if not provided by the input.
     ///
@@ -75,7 +82,7 @@ impl Default for PsbtParams {
     fn default() -> Self {
         Self {
             version: transaction::Version::TWO,
-            fallback_locktime: absolute::LockTime::ZERO,
+            min_locktime: absolute::LockTime::ZERO,
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
             sighash_type: None,
@@ -123,7 +130,7 @@ impl std::error::Error for CreatePsbtError {}
 impl Selection {
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
-    /// Returns the `fallback_locktime` if the locktimes iterator is empty, or the maximum
+    /// Returns the `min_locktime` if the locktimes iterator is empty, or the maximum
     /// locktime if all items share the same unit. A different-unit fallback is intentionally
     /// ignored so that e.g. a height-based fallback does not conflict with a time-based CLTV
     /// requirement.
@@ -137,7 +144,7 @@ impl Selection {
     /// [sel]: crate::Selector::new
     pub(crate) fn accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
-        fallback_locktime: absolute::LockTime,
+        min_locktime: absolute::LockTime,
     ) -> absolute::LockTime {
         let mut acc = Option::<absolute::LockTime>::None;
         for locktime in locktimes {
@@ -156,11 +163,11 @@ impl Selection {
         }
         match acc {
             // No required locktimes from inputs: use fallback directly.
-            None => fallback_locktime,
+            None => min_locktime,
             // Same unit as fallback: take the maximum of required and fallback.
-            Some(lock_time) if lock_time.is_same_unit(fallback_locktime) => {
-                if lock_time.is_implied_by(fallback_locktime) {
-                    fallback_locktime
+            Some(lock_time) if lock_time.is_same_unit(min_locktime) => {
+                if lock_time.is_implied_by(min_locktime) {
+                    min_locktime
                 } else {
                     lock_time
                 }
@@ -178,7 +185,7 @@ impl Selection {
                 self.inputs
                     .iter()
                     .filter_map(|input| input.absolute_timelock()),
-                params.fallback_locktime,
+                params.min_locktime,
             ),
             input: self
                 .inputs
@@ -263,7 +270,7 @@ mod tests {
     use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
 
     #[test]
-    fn test_fallback_locktime_height() -> anyhow::Result<()> {
+    fn test_min_locktime_height() -> anyhow::Result<()> {
         let abs_locktime = absolute::LockTime::from_consensus(100_000);
         let secp = Secp256k1::new();
         let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
@@ -309,7 +316,7 @@ mod tests {
             TestCase {
                 name: "larger fallback locktime is used",
                 psbt_params: PsbtParams {
-                    fallback_locktime: absolute::LockTime::from_consensus(100_100),
+                    min_locktime: absolute::LockTime::from_consensus(100_100),
                     ..Default::default()
                 },
                 exp_locktime: 100_100,
@@ -317,7 +324,7 @@ mod tests {
             TestCase {
                 name: "smaller fallback locktime is ignored",
                 psbt_params: PsbtParams {
-                    fallback_locktime: absolute::LockTime::from_consensus(99_900),
+                    min_locktime: absolute::LockTime::from_consensus(99_900),
                     ..Default::default()
                 },
                 exp_locktime: 100_000,
@@ -341,7 +348,7 @@ mod tests {
     /// requires a time-based (UNIX timestamp) CLTV, and that an explicit time-based
     /// fallback greater than the requirement is respected.
     #[test]
-    fn test_fallback_locktime_respects_lock_type() -> anyhow::Result<()> {
+    fn test_min_locktime_respects_lock_type() -> anyhow::Result<()> {
         let time_locktime = absolute::LockTime::from_consensus(1_734_230_218);
         let secp = Secp256k1::new();
         let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
@@ -384,7 +391,7 @@ mod tests {
         let larger_time = absolute::LockTime::from_consensus(1_772_167_108);
         assert!(larger_time > time_locktime);
         let psbt = selection.create_psbt(PsbtParams {
-            fallback_locktime: larger_time,
+            min_locktime: larger_time,
             ..Default::default()
         })?;
         assert_eq!(
@@ -397,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_create_psbt_does_not_apply_afs() -> anyhow::Result<()> {
-        // `create_psbt` is now AFS-free: lock_time matches `fallback_locktime`
+        // `create_psbt` is now AFS-free: lock_time matches `min_locktime`
         // when no input requires a CLTV.
         let secp = Secp256k1::new();
         let desc =
@@ -435,7 +442,7 @@ mod tests {
         };
 
         let psbt = selection.create_psbt(PsbtParams {
-            fallback_locktime: LockTime::from_consensus(current_height),
+            min_locktime: LockTime::from_consensus(current_height),
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         })?;
