@@ -217,8 +217,8 @@ impl TxTemplate {
 
     /// Build a [`Psbt`] from this template (non-consuming).
     ///
-    /// Doesn't consume `self`, so the template remains available for e.g.
-    /// [`TxTemplate::into_finalizer`] afterward.
+    /// Doesn't consume `self`, so the template remains available for
+    /// further use (e.g. [`TxTemplate::populate_finalizer`]).
     pub fn create_psbt(&self, params: PsbtBuildParams) -> Result<Psbt, CreatePsbtError> {
         let tx = self.build_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
@@ -267,13 +267,20 @@ impl TxTemplate {
         Ok(psbt)
     }
 
-    /// Into psbt [`Finalizer`].
-    pub fn into_finalizer(self) -> Finalizer {
-        Finalizer::new(
-            self.inputs
-                .iter()
-                .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
-        )
+    /// Populate a [`Finalizer`] with `(outpoint, plan)` pairs from this
+    /// template's inputs, then return `self` so it can be chained into
+    /// further construction (e.g. [`TxTemplate::create_psbt`]).
+    ///
+    /// Inputs without a `Plan` (i.e. `PsbtInput`-variant inputs) contribute
+    /// nothing — they don't need a finalizer entry because their PSBT input
+    /// already carries the satisfaction data.
+    pub fn populate_finalizer(self, finalizer: &mut Finalizer) -> Self {
+        for input in &self.inputs {
+            if let Some(plan) = input.plan() {
+                finalizer.insert(input.prev_outpoint(), plan.clone());
+            }
+        }
+        self
     }
 
     /// Shuffle the inputs in place.

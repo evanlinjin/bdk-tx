@@ -14,21 +14,26 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 ///
 /// # Usage
 ///
-/// Construct a [`Finalizer`] from a list of `(outpoint, plan)` pairs, or by calling
-/// [`into_finalizer`] on a particular [`Selection`]. Use [`finalize_input`] to finalize a single
-/// input, or [`finalize`] to finalize every input and return a map containing the result of
-/// finalization at each index. Upon finalizing the PSBT, the [`Finalizer`] also clears metadata
-/// from non-essential fields of the PSBT inputs and outputs, ensuring that only the necessary
-/// information remains for transaction extraction.
+/// Construct an empty [`Finalizer`] via [`Finalizer::default`], then populate
+/// it from a [`Selection`] or [`TxTemplate`] via their respective
+/// `populate_finalizer` methods (which consume and return `self` so the
+/// source can be chained into further construction stages). Use
+/// [`finalize_input`] to finalize a single input, or [`finalize`] to
+/// finalize every input and return a map containing the result of
+/// finalization at each index. Upon finalizing the PSBT, the [`Finalizer`]
+/// also clears metadata from non-essential fields of the PSBT inputs and
+/// outputs, ensuring that only the necessary information remains for
+/// transaction extraction.
 ///
 /// # Example
 ///
 /// ```ignore
-/// // Build a template from the selection, then create the PSBT and finalizer
-/// // from the same template.
-/// let template = selection.into_template(TemplateParams::default());
-/// let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
-/// let finalizer = template.into_finalizer();
+/// // Build a finalizer and the PSBT from a single chain.
+/// let mut finalizer = Finalizer::default();
+/// let mut psbt = selection
+///     .into_template(TemplateParams::default())
+///     .populate_finalizer(&mut finalizer)
+///     .create_psbt(PsbtBuildParams::default())?;
 ///
 /// // Sign the PSBT using your preferred method.
 /// let signer = bdk_tx::Signer(keymap);
@@ -44,22 +49,38 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 ///
 /// [BIP174]: <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer>
 /// [`Selection`]: crate::Selection
-/// [`into_finalizer`]: crate::Selection::into_finalizer
+/// [`TxTemplate`]: crate::TxTemplate
 /// [`Plan`]: miniscript::plan::Plan
 /// [`Transaction`]: bitcoin::Transaction
 /// [`finalize_input`]: Finalizer::finalize_input
 /// [`finalize`]: Finalizer::finalize
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Finalizer {
     pub(crate) plans: HashMap<OutPoint, Plan>,
 }
 
 impl Finalizer {
-    /// Create.
+    /// Create from an iterator of `(outpoint, plan)` pairs.
+    ///
+    /// For accumulating from a [`Selection`] or [`TxTemplate`], prefer
+    /// [`Finalizer::default`] + [`Selection::populate_finalizer`] /
+    /// [`TxTemplate::populate_finalizer`] so the source object can be
+    /// chained into further construction stages.
+    ///
+    /// [`Selection`]: crate::Selection
+    /// [`TxTemplate`]: crate::TxTemplate
+    /// [`Selection::populate_finalizer`]: crate::Selection::populate_finalizer
+    /// [`TxTemplate::populate_finalizer`]: crate::TxTemplate::populate_finalizer
     pub fn new(plans: impl IntoIterator<Item = (OutPoint, Plan)>) -> Self {
         Self {
             plans: plans.into_iter().collect(),
         }
+    }
+
+    /// Insert a single `(outpoint, plan)` pair into the finalizer. Any
+    /// existing entry for `outpoint` is replaced.
+    pub fn insert(&mut self, outpoint: OutPoint, plan: Plan) {
+        self.plans.insert(outpoint, plan);
     }
 
     /// Finalize a PSBT input and return whether finalization was successful or input was already
@@ -219,9 +240,12 @@ mod tests {
             outputs: vec![output],
         };
 
-        let template = selection.into_template(TemplateParams::default());
-        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
-        let finalizer = template.into_finalizer();
+        let mut finalizer = Finalizer::default();
+
+        let mut psbt = selection
+            .into_template(TemplateParams::default())
+            .populate_finalizer(&mut finalizer)
+            .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
@@ -243,9 +267,12 @@ mod tests {
             outputs: vec![output],
         };
 
-        let template = selection.into_template(TemplateParams::default());
-        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
-        let finalizer = template.into_finalizer();
+        let mut finalizer = Finalizer::default();
+
+        let mut psbt = selection
+            .into_template(TemplateParams::default())
+            .populate_finalizer(&mut finalizer)
+            .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
@@ -273,9 +300,12 @@ mod tests {
             ],
         };
 
-        let template = selection.into_template(TemplateParams::default());
-        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
-        let finalizer = template.into_finalizer();
+        let mut finalizer = Finalizer::default();
+
+        let mut psbt = selection
+            .into_template(TemplateParams::default())
+            .populate_finalizer(&mut finalizer)
+            .create_psbt(PsbtBuildParams::default())?;
 
         assert!(!psbt.outputs[0].tap_key_origins.is_empty());
         assert!(psbt.outputs[0].tap_internal_key.is_some());
@@ -371,9 +401,12 @@ mod tests {
             ],
         };
 
-        let template = selection.into_template(TemplateParams::default());
-        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
-        let finalizer = template.into_finalizer();
+        let mut finalizer = Finalizer::default();
+
+        let mut psbt = selection
+            .into_template(TemplateParams::default())
+            .populate_finalizer(&mut finalizer)
+            .create_psbt(PsbtBuildParams::default())?;
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
         let tap_internal_key = psbt.outputs[0].tap_internal_key;
@@ -403,9 +436,12 @@ mod tests {
             outputs: vec![output],
         };
 
-        let template = selection.into_template(TemplateParams::default());
-        let mut psbt = template.create_psbt(PsbtBuildParams::default())?;
-        let finalizer = template.into_finalizer();
+        let mut finalizer = Finalizer::default();
+
+        let mut psbt = selection
+            .into_template(TemplateParams::default())
+            .populate_finalizer(&mut finalizer)
+            .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);

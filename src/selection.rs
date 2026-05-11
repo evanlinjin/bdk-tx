@@ -73,13 +73,20 @@ impl Selection {
         }
     }
 
-    /// Into psbt finalizer.
-    pub fn into_finalizer(self) -> Finalizer {
-        Finalizer::new(
-            self.inputs
-                .iter()
-                .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
-        )
+    /// Populate a [`Finalizer`] with `(outpoint, plan)` pairs from this
+    /// selection's inputs, then return `self` so it can be chained into
+    /// further construction (e.g. [`Selection::into_template`]).
+    ///
+    /// Inputs without a `Plan` (i.e. `PsbtInput`-variant inputs) contribute
+    /// nothing — they don't need a finalizer entry because their PSBT input
+    /// already carries the satisfaction data.
+    pub fn populate_finalizer(self, finalizer: &mut Finalizer) -> Self {
+        for input in &self.inputs {
+            if let Some(plan) = input.plan() {
+                finalizer.insert(input.prev_outpoint(), plan.clone());
+            }
+        }
+        self
     }
 }
 
