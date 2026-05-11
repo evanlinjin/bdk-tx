@@ -14,12 +14,11 @@ pub enum AntiFeeSnipingError {
     /// AFS could not apply: the effective `lock_time` is time-based (which
     /// makes the locktime branch a no-op under BIP326's height-based
     /// semantics), and the sequence branch is also ineligible — one or
-    /// more inputs are non-taproot, unconfirmed, have more than
-    /// `MAX_RELATIVE_HEIGHT` confirmations, or `params.version` is below
-    /// [`Version::TWO`].
+    /// more inputs are non-taproot, unconfirmed, or have more than
+    /// `MAX_RELATIVE_HEIGHT` confirmations.
     ///
     /// Remedies: remove the time-based input CLTV / fallback, switch to
-    /// taproot+confirmed inputs in a v2 RBF-signaling tx, or skip AFS for
+    /// taproot+confirmed inputs in an RBF-signaling tx, or skip AFS for
     /// this transaction.
     NoApplicableBranch(LockTime),
 }
@@ -58,11 +57,11 @@ impl Selection {
     ///
     /// # Behavior contract
     ///
-    /// - The sequence branch requires `params.version >= Version::TWO`
-    ///   (BIP68/CSV semantics — the sequence value is interpreted as a
-    ///   relative locktime, which only activates for v2+ transactions). If
-    ///   `params.version` is below `Version::TWO`, AFS forces the locktime
-    ///   branch; `params.version` is **not** modified.
+    /// - The sequence branch requires v2+ (BIP68/CSV). If AFS picks it
+    ///   while `params.min_version < Version::TWO`, the minimum is
+    ///   **opportunistically bumped** to `Version::TWO` — the rename to
+    ///   `min_version` makes this bump semantically honest, and v1 has no
+    ///   modern wallet use case worth preserving here.
     /// - If the transaction's effective locktime (the value [`create_psbt`]
     ///   would produce from `params.min_locktime` and any input-required
     ///   CLTVs) is **time-based**, the locktime branch can't apply — AFS's
@@ -99,9 +98,11 @@ impl Selection {
     /// ```
     ///
     /// `params` is borrowed mutably because AFS reads other fields
-    /// (`version`, `fallback_sequence`, `min_locktime`) to decide which
-    /// branch to take; the caller's choices on those fields must be set
-    /// before calling AFS so its decisions stay consistent with them.
+    /// (`min_version`, `fallback_sequence`, `min_locktime`) to decide which
+    /// branch to take, and may bump `min_version` (to V2) and `min_locktime`
+    /// (to a tip-derived value) when it picks the locktime / sequence
+    /// branch respectively. The caller's choices on those fields are
+    /// treated as floors.
     ///
     /// [`create_psbt`]: Selection::create_psbt
     ///
@@ -167,8 +168,7 @@ impl Selection {
             .map(|h| h.to_consensus_u32() > 0)
             .unwrap_or(false);
 
-        let must_use_locktime = params.version < Version::TWO
-            || preserve_existing_locktime
+        let must_use_locktime = preserve_existing_locktime
             || self.inputs.iter().any(|input| {
                 let confirmation = input.confirmations(tip_height);
                 confirmation == 0
@@ -208,6 +208,9 @@ impl Selection {
 
             params.min_locktime = LockTime::from_height(locktime).expect("must be valid Height");
         } else {
+            // Sequence branch needs BIP68 semantics: bump min_version to V2.
+            params.min_version = params.min_version.max(Version::TWO);
+
             let random_index = random_range(rng, taproot_inputs.len() as u32);
             let input_index = taproot_inputs[random_index as usize];
             let confirmation = self.inputs[input_index].confirmations(tip_height);
@@ -401,13 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_v1_forces_locktime_branch() {
-        // v1 disables BIP68 — the sequence branch can't work. AFS should
-        // force the locktime branch and leave params.version untouched.
+    fn test_anti_fee_sniping_v1_min_version_is_bumped_opportunistically() {
+        // With min_version=V1, AFS may pick either branch. If it picks
+        // sequence, params.min_version is bumped to V2 (BIP68 needs v2).
+        // If it picks locktime, min_version stays at V1.
         let input = taproot_test_input(800_000).unwrap();
         let tip_height = Height::from_consensus(800_050).unwrap();
 
-        for _ in 0..50 {
+        let mut saw_locktime_branch = false;
+        let mut saw_sequence_branch = false;
+        let mut loops = 0;
+        while !saw_locktime_branch || !saw_sequence_branch {
             let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![Output::with_script(
@@ -416,28 +423,33 @@ mod tests {
                 )],
             };
             let mut params = PsbtParams {
-                version: Version::ONE,
-                min_locktime: LockTime::ZERO,
-                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                min_version: Version::ONE,
                 ..Default::default()
             };
             let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
-            assert_eq!(
-                params.version,
-                Version::ONE,
-                "params.version must not be silently mutated"
-            );
-            assert!(
-                params.min_locktime > LockTime::ZERO,
-                "AFS should have taken the locktime branch at v1"
-            );
-            assert_eq!(
-                selection.inputs[0].sequence(),
-                None,
-                "no sequence override should have been set"
-            );
+
+            if selection.inputs[0].sequence().is_some() {
+                saw_sequence_branch = true;
+                assert_eq!(
+                    params.min_version,
+                    Version::TWO,
+                    "sequence branch must bump min_version to V2"
+                );
+                assert_eq!(params.min_locktime, LockTime::ZERO);
+            } else {
+                saw_locktime_branch = true;
+                assert_eq!(
+                    params.min_version,
+                    Version::ONE,
+                    "locktime branch must NOT bump min_version"
+                );
+                assert!(params.min_locktime > LockTime::ZERO);
+            }
+
+            loops += 1;
+            assert!(loops < 30, "failed to observe both branches");
         }
     }
 

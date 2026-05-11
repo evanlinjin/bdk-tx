@@ -40,8 +40,17 @@ pub struct Selection {
 /// Parameters for creating a psbt.
 #[derive(Debug, Clone)]
 pub struct PsbtParams {
-    /// Use a specific [`transaction::Version`].
-    pub version: transaction::Version,
+    /// Minimum tx version.
+    ///
+    /// Acts as a floor on `tx.version`: [`Selection::create_psbt`] bumps it
+    /// up to `Version::TWO` if any input requires CSV (`relative_timelock`),
+    /// and [`Selection::apply_anti_fee_sniping`] bumps it when it picks the
+    /// sequence branch (which needs BIP68 semantics).
+    ///
+    /// Default: [`transaction::Version::TWO`] — what modern wallets want.
+    /// Set to [`transaction::Version::ONE`] if you want the construction to
+    /// stay at v1 *unless* something forces it higher.
+    pub min_version: transaction::Version,
 
     /// Minimum tx locktime.
     ///
@@ -81,7 +90,7 @@ pub struct PsbtParams {
 impl Default for PsbtParams {
     fn default() -> Self {
         Self {
-            version: transaction::Version::TWO,
+            min_version: transaction::Version::TWO,
             min_locktime: absolute::LockTime::ZERO,
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
@@ -179,8 +188,19 @@ impl Selection {
 
     /// Create PSBT.
     pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        // Bump tx.version above params.min_version if any input requires CSV
+        // semantics (BIP112). Without v2+, the script's CSV opcode fails.
+        let inputs_require_v2 = self
+            .inputs
+            .iter()
+            .any(|input| input.relative_timelock().is_some());
+        let tx_version = if inputs_require_v2 {
+            params.min_version.max(transaction::Version::TWO)
+        } else {
+            params.min_version
+        };
         let tx = bitcoin::Transaction {
-            version: params.version,
+            version: tx_version,
             lock_time: Self::accumulate_max_locktime(
                 self.inputs
                     .iter()
