@@ -18,15 +18,6 @@ pub enum AntiFeeSnipingError {
     /// either remove the time-based fallback / time-based input CLTV, or skip
     /// AFS for this transaction.
     TimeBasedLocktime(LockTime),
-    /// The transaction's effective `lock_time` is at a block height above the
-    /// supplied `tip`. Applying AFS at the tip would lower `lock_time` below
-    /// an input-required CLTV. Use a `tip_height` >= the existing locktime.
-    TipBelowExistingLocktime {
-        /// The transaction's effective `lock_time` height.
-        existing: absolute::Height,
-        /// The supplied tip height.
-        tip: absolute::Height,
-    },
     /// Inputs have absolute locktimes of mixed units (height + time). The
     /// transaction would fail to build; fix the inputs before applying AFS.
     LockTypeMismatch,
@@ -42,12 +33,6 @@ impl Display for AntiFeeSnipingError {
                 f,
                 "anti-fee-sniping is incompatible with time-based lock_time {}",
                 lt
-            ),
-            AntiFeeSnipingError::TipBelowExistingLocktime { existing, tip } => write!(
-                f,
-                "tip height {} is below the transaction's effective lock_time {}",
-                tip.to_consensus_u32(),
-                existing.to_consensus_u32(),
             ),
             AntiFeeSnipingError::LockTypeMismatch => {
                 write!(f, "inputs have locktimes of mixed units")
@@ -81,9 +66,12 @@ impl Selection {
     /// - `params.version` must be >= 2.
     /// - The transaction's effective locktime (the value [`create_psbt`]
     ///   would produce from the current `params.fallback_locktime` and any
-    ///   input-required CLTVs) must be a block height at or below
-    ///   `tip_height`. Time-based effective locktimes are rejected; existing
-    ///   heights above the tip are rejected.
+    ///   input-required CLTVs) must be height-based. Time-based effective
+    ///   locktimes are rejected. Heights *above* `tip_height` are accepted —
+    ///   the tx is already future-locked beyond what AFS could add, and
+    ///   [`accumulate_max_locktime`][acc] will preserve the higher CLTV.
+    ///
+    /// [acc]: Selection::accumulate_max_locktime
     /// - If the effective locktime is non-zero (i.e. some input required a
     ///   CLTV), the locktime branch is forced and the written value is
     ///   clamped to `>= effective_height`. The sequence branch never runs
@@ -123,15 +111,10 @@ impl Selection {
         .map_err(|_| AntiFeeSnipingError::LockTypeMismatch)?;
 
         let effective_height = match effective_locktime {
-            LockTime::Blocks(h) => {
-                if h > tip_height {
-                    return Err(AntiFeeSnipingError::TipBelowExistingLocktime {
-                        existing: h,
-                        tip: tip_height,
-                    });
-                }
-                h
-            }
+            // A height above the supplied tip is fine: the tx is already
+            // future-locked beyond what AFS could add, so accumulate_max_locktime
+            // will preserve the higher CLTV regardless of what AFS writes.
+            LockTime::Blocks(h) => h,
             LockTime::Seconds(_) => {
                 return Err(AntiFeeSnipingError::TimeBasedLocktime(effective_locktime));
             }
@@ -424,7 +407,13 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_tip_below_existing_error() {
+    fn test_anti_fee_sniping_accepts_existing_above_tip() {
+        // When the effective lock_time is above the tip (e.g. an input has a
+        // future-dated CLTV), AFS should NOT error — the tx is already
+        // future-locked beyond what AFS could add, and accumulate_max_locktime
+        // preserves the higher CLTV. AFS may still apply (it'll write a
+        // tip-ish locktime that gets dominated by the input CLTV during
+        // create_psbt).
         let input = taproot_test_input(800_000).unwrap();
         let mut selection = Selection {
             inputs: vec![input],
@@ -438,16 +427,13 @@ mod tests {
         };
         let tip_height = Height::from_consensus(800_050).unwrap();
 
-        let result = selection.apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng);
-        assert!(
-            matches!(
-                result,
-                Err(AntiFeeSnipingError::TipBelowExistingLocktime { existing: e, tip: t })
-                    if e == existing && t == tip_height
-            ),
-            "expected TipBelowExistingLocktime, got {:?}",
-            result
-        );
+        selection
+            .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
+            .expect("AFS should accept effective locktime above tip");
+
+        // The clamp inside AFS ensures params.fallback_locktime ends up at
+        // least the existing height.
+        assert!(params.fallback_locktime.to_consensus_u32() >= existing.to_consensus_u32());
     }
 
     #[test]
