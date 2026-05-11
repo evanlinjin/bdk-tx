@@ -11,11 +11,17 @@ use rand_core::RngCore;
 /// Errors that can occur while applying [`Selection::apply_anti_fee_sniping`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntiFeeSnipingError {
-    /// The transaction's effective `lock_time` is time-based (Unix timestamp),
-    /// which is incompatible with BIP326's height-based AFS. The caller should
-    /// either remove the time-based fallback / time-based input CLTV, or skip
-    /// AFS for this transaction.
-    TimeBasedLocktime(LockTime),
+    /// AFS could not apply: the effective `lock_time` is time-based (which
+    /// makes the locktime branch a no-op under BIP326's height-based
+    /// semantics), and the sequence branch is also ineligible — one or
+    /// more inputs are non-taproot, unconfirmed, have more than
+    /// `MAX_RELATIVE_HEIGHT` confirmations, or `params.version` is below
+    /// [`Version::TWO`].
+    ///
+    /// Remedies: remove the time-based input CLTV / fallback, switch to
+    /// taproot+confirmed inputs in a v2 RBF-signaling tx, or skip AFS for
+    /// this transaction.
+    NoApplicableBranch(LockTime),
     /// Inputs have absolute locktimes of mixed units (height + time). The
     /// transaction would fail to build; fix the inputs before applying AFS.
     LockTypeMismatch,
@@ -24,9 +30,9 @@ pub enum AntiFeeSnipingError {
 impl Display for AntiFeeSnipingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AntiFeeSnipingError::TimeBasedLocktime(lt) => write!(
+            AntiFeeSnipingError::NoApplicableBranch(lt) => write!(
                 f,
-                "anti-fee-sniping is incompatible with time-based lock_time {}",
+                "anti-fee-sniping cannot apply: time-based lock_time {} blocks the locktime branch and the sequence branch is ineligible",
                 lt
             ),
             AntiFeeSnipingError::LockTypeMismatch => {
@@ -70,7 +76,7 @@ impl Selection {
     ///   dropped by [`accumulate_max_locktime`][acc]. In that case AFS forces
     ///   the sequence branch. If the sequence branch is also ineligible
     ///   (non-taproot input, unconfirmed input, RBF disabled, etc.), AFS
-    ///   returns [`AntiFeeSnipingError::TimeBasedLocktime`].
+    ///   returns [`AntiFeeSnipingError::NoApplicableBranch`].
     /// - If the effective locktime is height-based and **above the tip**, the
     ///   tx is already future-locked; AFS may still run, but the locktime
     ///   branch's write is dominated by the input CLTV inside
@@ -184,7 +190,7 @@ impl Selection {
 
         // If both branches are unavailable, AFS can't do anything.
         if must_use_locktime && must_use_sequence {
-            return Err(AntiFeeSnipingError::TimeBasedLocktime(effective_locktime));
+            return Err(AntiFeeSnipingError::NoApplicableBranch(effective_locktime));
         }
 
         let use_locktime = must_use_locktime
@@ -479,9 +485,9 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_time_based_locktime_and_non_taproot_errors() {
+    fn test_anti_fee_sniping_no_applicable_branch() {
         // Time-based effective locktime AND no taproot inputs → both
-        // branches infeasible → must error with TimeBasedLocktime.
+        // branches infeasible → must error with NoApplicableBranch.
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
         let desc_pk: DescriptorPublicKey = pk.parse().unwrap();
@@ -520,8 +526,8 @@ mod tests {
 
         let result = selection.apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng);
         assert!(
-            matches!(result, Err(AntiFeeSnipingError::TimeBasedLocktime(lt)) if lt == time_locktime),
-            "expected TimeBasedLocktime error, got {:?}",
+            matches!(result, Err(AntiFeeSnipingError::NoApplicableBranch(lt)) if lt == time_locktime),
+            "expected NoApplicableBranch error, got {:?}",
             result
         );
     }
