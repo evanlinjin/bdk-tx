@@ -1,4 +1,4 @@
-use crate::{PsbtParams, Selection, SetSequenceError};
+use crate::{PsbtParams, Selection};
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display};
 use miniscript::bitcoin::{
@@ -21,11 +21,6 @@ pub enum AntiFeeSnipingError {
     /// Inputs have absolute locktimes of mixed units (height + time). The
     /// transaction would fail to build; fix the inputs before applying AFS.
     LockTypeMismatch,
-    /// The taproot input chosen for the sequence branch already requires a
-    /// stronger relative-timelock than AFS's freshness signal would provide.
-    /// Pre-filter taproot inputs to avoid this, or rely on the locktime
-    /// branch.
-    InputSequence(SetSequenceError),
 }
 
 impl Display for AntiFeeSnipingError {
@@ -42,7 +37,6 @@ impl Display for AntiFeeSnipingError {
             AntiFeeSnipingError::LockTypeMismatch => {
                 write!(f, "inputs have locktimes of mixed units")
             }
-            AntiFeeSnipingError::InputSequence(e) => Display::fmt(e, f),
         }
     }
 }
@@ -135,11 +129,19 @@ impl Selection {
                 < 0xfffffffe
         });
 
+        // Taproot inputs are eligible for the sequence branch only if they
+        // have no existing relative-timelock requirement: AFS's freshness
+        // signal (~confirmation depth, possibly minus a random offset) could
+        // otherwise be weaker than the input's required value and produce an
+        // invalid transaction. If filtering empties the pool, the locktime
+        // branch is forced via the `taproot_inputs.is_empty()` clause below.
         let taproot_inputs: Vec<usize> = self
             .inputs
             .iter()
             .enumerate()
-            .filter(|(_, input)| input.prev_txout().script_pubkey.is_p2tr())
+            .filter(|(_, input)| {
+                input.prev_txout().script_pubkey.is_p2tr() && input.relative_timelock().is_none()
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -190,7 +192,7 @@ impl Selection {
 
             self.inputs[input_index]
                 .set_sequence(Sequence(sequence_value))
-                .map_err(AntiFeeSnipingError::InputSequence)?;
+                .expect("taproot_inputs filtered to inputs without relative-timelock");
         }
 
         Ok(())
@@ -518,5 +520,76 @@ mod tests {
             }
         }
         assert!(at_least_one_change, "AFS should have mutated something");
+    }
+
+    #[test]
+    fn test_anti_fee_sniping_skips_inputs_with_relative_timelock() -> anyhow::Result<()> {
+        // A taproot input whose stored sequence encodes `older(50)` must not
+        // be picked for the sequence branch — AFS's offset could underflow
+        // that requirement. With only such inputs, the locktime branch is
+        // forced.
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let pubkey =
+            bitcoin::key::XOnlyPublicKey::from_slice(&[2u8; 32]).expect("valid x-only pubkey");
+        let p2tr_script = bitcoin::ScriptBuf::new_p2tr(&secp, pubkey, None);
+        assert!(p2tr_script.is_p2tr());
+
+        let older_sequence = Sequence::from_height(50);
+        let psbt_input = bitcoin::psbt::Input {
+            witness_utxo: Some(TxOut {
+                script_pubkey: p2tr_script,
+                value: Amount::from_sat(10_000),
+            }),
+            ..Default::default()
+        };
+        use bitcoin::hashes::Hash;
+        let outpoint = bitcoin::OutPoint::new(bitcoin::Txid::all_zeros(), 0);
+        let status = ConfirmationStatus {
+            height: Height::from_consensus(2_000)?,
+            prev_mtp: Some(Time::from_consensus(500_000_000)?),
+        };
+        let input = Input::from_psbt_input(
+            outpoint,
+            older_sequence,
+            psbt_input,
+            64,
+            Some(status),
+            false,
+        )?;
+        assert_eq!(
+            input.relative_timelock(),
+            older_sequence.to_relative_lock_time()
+        );
+
+        let tip_height = Height::from_consensus(2_500).unwrap();
+        // Run AFS many times; every run must end up in the locktime branch
+        // (sequence branch would otherwise violate the older() constraint).
+        for _ in 0..50 {
+            let mut selection = Selection {
+                inputs: vec![input.clone()],
+                outputs: vec![Output::with_script(
+                    ScriptBuf::new(),
+                    Amount::from_sat(9_000),
+                )],
+            };
+            let mut params = PsbtParams {
+                fallback_locktime: LockTime::ZERO,
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            };
+            selection
+                .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
+                .unwrap();
+            assert!(
+                params.fallback_locktime > LockTime::ZERO,
+                "AFS should take the locktime branch when the only taproot input has a relative timelock"
+            );
+            assert_eq!(
+                selection.inputs[0].sequence(),
+                Some(older_sequence),
+                "stored sequence must be preserved"
+            );
+        }
+        Ok(())
     }
 }
