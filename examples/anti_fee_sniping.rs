@@ -89,8 +89,8 @@ fn main() -> anyhow::Result<()> {
             )?;
 
         let mut params = PsbtParams::default();
-        let mut selection = selection;
-        selection.apply_anti_fee_sniping(&mut params, tip_height, &mut rand::thread_rng())?;
+        let selection =
+            selection.apply_anti_fee_sniping(&mut params, tip_height, &mut rand::thread_rng())?;
         let psbt = selection.create_psbt(params)?;
 
         let tx = psbt.unsigned_tx;

@@ -87,16 +87,32 @@ impl Selection {
     /// This step modifies inputs and params before any PSBT is built and
     /// signed, so no signatures can be silently invalidated by this call.
     ///
+    /// # Ownership
+    ///
+    /// Consumes `self` and returns the (possibly-mutated) [`Selection`] on
+    /// success, so it can be chained directly into [`create_psbt`]:
+    ///
+    /// ```ignore
+    /// let psbt = selection
+    ///     .apply_anti_fee_sniping(&mut params, tip, &mut rng)?
+    ///     .create_psbt(params)?;
+    /// ```
+    ///
+    /// `params` is borrowed mutably because AFS reads other fields
+    /// (`version`, `fallback_sequence`, `fallback_locktime`) to decide which
+    /// branch to take; the caller's choices on those fields must be set
+    /// before calling AFS so its decisions stay consistent with them.
+    ///
     /// [`create_psbt`]: Selection::create_psbt
     ///
     /// # See Also
     /// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
     pub fn apply_anti_fee_sniping(
-        &mut self,
+        mut self,
         params: &mut PsbtParams,
         tip_height: absolute::Height,
         rng: &mut impl RngCore,
-    ) -> Result<(), AntiFeeSnipingError> {
+    ) -> Result<Self, AntiFeeSnipingError> {
         const MAX_RELATIVE_HEIGHT: u32 = 65_535;
         const FIFTY_PERCENT_PROBABILITY_RANGE: u32 = 2;
         const MIN_SEQUENCE_VALUE: u32 = 1;
@@ -211,7 +227,7 @@ impl Selection {
                 .expect("taproot_inputs filtered to inputs without relative-timelock");
         }
 
-        Ok(())
+        Ok(self)
     }
 }
 
@@ -291,7 +307,7 @@ mod tests {
 
         while !used_locktime || !used_sequence {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![output],
             };
@@ -300,7 +316,7 @@ mod tests {
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             let psbt = selection.create_psbt(params.clone()).unwrap();
@@ -353,7 +369,7 @@ mod tests {
         let mut loops = 0;
 
         while !used_locktime || !used_sequence {
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input1.clone(), input2.clone(), input3.clone()],
                 outputs: vec![output.clone()],
             };
@@ -362,7 +378,7 @@ mod tests {
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             let psbt = selection.create_psbt(params).unwrap();
@@ -394,7 +410,7 @@ mod tests {
         let tip_height = Height::from_consensus(800_050).unwrap();
 
         for _ in 0..50 {
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![Output::with_script(
                     ScriptBuf::new(),
@@ -407,7 +423,7 @@ mod tests {
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             assert_eq!(
@@ -437,7 +453,7 @@ mod tests {
         let tip_height = Height::from_consensus(800_050).unwrap();
 
         for _ in 0..50 {
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![],
             };
@@ -446,7 +462,7 @@ mod tests {
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .expect("AFS should force sequence branch when effective locktime is time-based");
 
@@ -490,7 +506,7 @@ mod tests {
         };
         let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status)).unwrap();
 
-        let mut selection = Selection {
+        let selection = Selection {
             inputs: vec![input],
             outputs: vec![],
         };
@@ -519,7 +535,7 @@ mod tests {
         // tip-ish locktime that gets dominated by the input CLTV during
         // create_psbt).
         let input = taproot_test_input(800_000).unwrap();
-        let mut selection = Selection {
+        let selection = Selection {
             inputs: vec![input],
             outputs: vec![],
         };
@@ -531,7 +547,7 @@ mod tests {
         };
         let tip_height = Height::from_consensus(800_050).unwrap();
 
-        selection
+        let _selection = selection
             .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
             .expect("AFS should accept effective locktime above tip");
 
@@ -552,7 +568,7 @@ mod tests {
         let tip_height = Height::from_consensus(tip).unwrap();
 
         for _ in 0..200 {
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![],
             };
@@ -561,7 +577,7 @@ mod tests {
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             // Existing > 0 forces the locktime branch.
@@ -588,7 +604,7 @@ mod tests {
 
         let mut at_least_one_change = false;
         for _ in 0..10 {
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![Output::with_script(
                     ScriptBuf::new(),
@@ -603,7 +619,7 @@ mod tests {
             let original_lt = params.fallback_locktime;
             let original_seq = selection.inputs[0].sequence();
 
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
 
@@ -659,7 +675,7 @@ mod tests {
         // Run AFS many times; every run must end up in the locktime branch
         // (sequence branch would otherwise violate the older() constraint).
         for _ in 0..50 {
-            let mut selection = Selection {
+            let selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![Output::with_script(
                     ScriptBuf::new(),
@@ -671,7 +687,7 @@ mod tests {
                 fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             };
-            selection
+            let selection = selection
                 .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
             assert!(
