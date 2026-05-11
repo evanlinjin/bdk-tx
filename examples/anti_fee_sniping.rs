@@ -89,14 +89,9 @@ fn main() -> anyhow::Result<()> {
             )?;
 
         let mut params = PsbtParams::default();
-        let input_confirmations: Vec<u32> = selection
-            .inputs
-            .iter()
-            .map(|i| i.confirmations(tip_height))
-            .collect();
-        let psbt = selection
-            .apply_anti_fee_sniping(&mut params, tip_height, &mut rand::thread_rng())?
-            .create_psbt(params)?;
+        let selection =
+            selection.apply_anti_fee_sniping(&mut params, tip_height, &mut rand::thread_rng())?;
+        let psbt = selection.create_psbt(params)?;
 
         let tx = psbt.unsigned_tx;
 
@@ -124,7 +119,7 @@ fn main() -> anyhow::Result<()> {
                 let sequence_value = inp.sequence.to_consensus_u32();
 
                 if (1..0xFFFFFFFD).contains(&sequence_value) {
-                    let input_confirmations = input_confirmations[i];
+                    let input_confirmations = selection.inputs[i].confirmations(tip_height);
                     let offset = input_confirmations.saturating_sub(sequence_value);
 
                     if offset > 0 {
