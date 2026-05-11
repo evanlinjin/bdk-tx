@@ -5,6 +5,7 @@ use core::fmt::{self, Debug, Display};
 use miniscript::bitcoin;
 use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
+use rand_core::RngCore;
 
 use crate::{Finalizer, Input, Output, Selection};
 
@@ -273,5 +274,99 @@ impl TxTemplate {
                 .iter()
                 .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
         )
+    }
+
+    /// Shuffle the inputs in place.
+    ///
+    /// Useful for privacy: the order in which a coin selector picks inputs
+    /// can leak information about the wallet (selection algorithm, UTXO
+    /// freshness, etc.). Bitcoin Core shuffles inputs by default; this
+    /// library leaves the choice to the caller.
+    pub fn shuffle_inputs(mut self, rng: &mut impl RngCore) -> Self {
+        fisher_yates_shuffle(&mut self.inputs, rng);
+        self
+    }
+
+    /// Shuffle the outputs in place.
+    ///
+    /// Useful for privacy: the position of the change output (typically
+    /// last) is otherwise a strong heuristic for transaction analysis.
+    /// Bitcoin Core shuffles outputs by default; this library leaves the
+    /// choice to the caller.
+    pub fn shuffle_outputs(mut self, rng: &mut impl RngCore) -> Self {
+        fisher_yates_shuffle(&mut self.outputs, rng);
+        self
+    }
+}
+
+/// In-place Fisher–Yates shuffle using only [`RngCore`].
+///
+/// Uses rejection sampling for unbiased index selection. Allocation-free.
+fn fisher_yates_shuffle<T>(slice: &mut [T], rng: &mut impl RngCore) {
+    let len = slice.len();
+    if len < 2 {
+        return;
+    }
+    for i in (1..len).rev() {
+        let j = random_range(rng, (i + 1) as u32) as usize;
+        slice.swap(i, j);
+    }
+}
+
+/// Returns a random value in `[0, n)` using rejection sampling (unbiased).
+fn random_range(rng: &mut impl RngCore, n: u32) -> u32 {
+    debug_assert!(n > 0);
+    let threshold = n.wrapping_neg() % n;
+    loop {
+        let v = rng.next_u32();
+        if v >= threshold {
+            return v % n;
+        }
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    #[test]
+    fn test_fisher_yates_preserves_multiset() {
+        // Shuffling preserves the multiset of elements (length, contents).
+        let mut v: Vec<u32> = (0..50).collect();
+        let original = v.clone();
+        fisher_yates_shuffle(&mut v, &mut OsRng);
+        v.sort();
+        assert_eq!(v, original);
+    }
+
+    #[test]
+    fn test_fisher_yates_eventually_permutes() {
+        // Across many iterations, shuffling produces at least one ordering
+        // different from the input. (Probability of N iterations all being
+        // identity for length 10 is (1/10!)^N — vanishing.)
+        let mut at_least_one_change = false;
+        for _ in 0..20 {
+            let mut v: Vec<u32> = (0..10).collect();
+            let original = v.clone();
+            fisher_yates_shuffle(&mut v, &mut OsRng);
+            if v != original {
+                at_least_one_change = true;
+                break;
+            }
+        }
+        assert!(at_least_one_change);
+    }
+
+    #[test]
+    fn test_fisher_yates_handles_trivial_lengths() {
+        let mut empty: Vec<u32> = vec![];
+        fisher_yates_shuffle(&mut empty, &mut OsRng);
+        assert!(empty.is_empty());
+
+        let mut single = vec![42u32];
+        fisher_yates_shuffle(&mut single, &mut OsRng);
+        assert_eq!(single, vec![42]);
     }
 }
