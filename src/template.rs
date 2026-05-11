@@ -7,7 +7,7 @@ use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{Finalizer, Input, Output, Selection};
+use crate::{Finalizer, Input, Output, Selection, SetSequenceError};
 
 /// Default sequence used for plan-based inputs that don't specify their own.
 ///
@@ -120,6 +120,47 @@ impl TxTemplate {
     /// Outputs in the resulting tx.
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
+    }
+
+    /// Override the sequence of the input at `index`.
+    ///
+    /// Thin delegate to [`Input::set_sequence`] — the new value is checked
+    /// against the input's existing relative-timelock requirement (if any)
+    /// before being written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetSequenceError::IncompatibleRelativeTimelock`] when the
+    /// new sequence would not satisfy the input's existing relative-timelock
+    /// requirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    pub fn set_input_sequence(
+        mut self,
+        index: usize,
+        sequence: bitcoin::Sequence,
+    ) -> Result<Self, SetSequenceError> {
+        self.inputs[index].set_sequence(sequence)?;
+        Ok(self)
+    }
+
+    /// Set the sighash type for the input at `index`.
+    ///
+    /// Thin delegate to [`Input::set_sighash_type`]. Useful for advanced
+    /// workflows (atomic swaps, coordinated txs, ANYONECANPAY).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    pub fn set_input_sighash(
+        mut self,
+        index: usize,
+        sighash: Option<bitcoin::psbt::PsbtSighashType>,
+    ) -> Self {
+        self.inputs[index].set_sighash_type(sighash);
+        self
     }
 }
 
