@@ -58,12 +58,11 @@ impl Selection {
     ///
     /// # Behavior contract
     ///
-    /// - If `params.version` is below [`Version::TWO`], it is **bumped to
-    ///   `Version::TWO`** before AFS runs — BIP326 requires v2 semantics
-    ///   (relative-locktime via BIP68/CSV) for the sequence branch, and v1
-    ///   transactions have no modern wallet use case worth preserving here.
-    ///   If you need a specific lower version for some reason, do not call
-    ///   this function.
+    /// - The sequence branch requires `params.version >= Version::TWO`
+    ///   (BIP68/CSV semantics — the sequence value is interpreted as a
+    ///   relative locktime, which only activates for v2+ transactions). If
+    ///   `params.version` is below `Version::TWO`, AFS forces the locktime
+    ///   branch; `params.version` is **not** modified.
     /// - The transaction's effective locktime (the value [`create_psbt`]
     ///   would produce from the current `params.fallback_locktime` and any
     ///   input-required CLTVs) must be height-based. Time-based effective
@@ -98,11 +97,6 @@ impl Selection {
         const MIN_SEQUENCE_VALUE: u32 = 1;
         const TEN_PERCENT_PROBABILITY_RANGE: u32 = 10;
         const MAX_RANDOM_OFFSET: u32 = 100;
-
-        // AFS requires v2 semantics; silently bump if needed (documented).
-        if params.version < Version::TWO {
-            params.version = Version::TWO;
-        }
 
         // Compute the effective locktime that create_psbt would produce.
         let effective_locktime = Selection::accumulate_max_locktime(
@@ -152,7 +146,8 @@ impl Selection {
         // that CLTV.
         let preserve_existing_locktime = effective_height.to_consensus_u32() > 0;
 
-        let must_use_locktime = preserve_existing_locktime
+        let must_use_locktime = params.version < Version::TWO
+            || preserve_existing_locktime
             || self.inputs.iter().any(|input| {
                 let confirmation = input.confirmations(tip_height);
                 confirmation == 0
@@ -372,24 +367,44 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_bumps_version_to_two() {
+    fn test_anti_fee_sniping_v1_forces_locktime_branch() {
+        // v1 disables BIP68 — the sequence branch can't work. AFS should
+        // force the locktime branch and leave params.version untouched.
         let input = taproot_test_input(800_000).unwrap();
-        let mut selection = Selection {
-            inputs: vec![input],
-            outputs: vec![],
-        };
-        let mut params = PsbtParams {
-            version: Version::ONE,
-            fallback_locktime: LockTime::ZERO,
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            ..Default::default()
-        };
         let tip_height = Height::from_consensus(800_050).unwrap();
 
-        selection
-            .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
-            .expect("AFS should auto-bump version to TWO");
-        assert_eq!(params.version, Version::TWO);
+        for _ in 0..50 {
+            let mut selection = Selection {
+                inputs: vec![input.clone()],
+                outputs: vec![Output::with_script(
+                    ScriptBuf::new(),
+                    Amount::from_sat(9_000),
+                )],
+            };
+            let mut params = PsbtParams {
+                version: Version::ONE,
+                fallback_locktime: LockTime::ZERO,
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            };
+            selection
+                .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
+                .unwrap();
+            assert_eq!(
+                params.version,
+                Version::ONE,
+                "params.version must not be silently mutated"
+            );
+            assert!(
+                params.fallback_locktime > LockTime::ZERO,
+                "AFS should have taken the locktime branch at v1"
+            );
+            assert_eq!(
+                selection.inputs[0].sequence(),
+                None,
+                "no sequence override should have been set"
+            );
+        }
     }
 
     #[test]
