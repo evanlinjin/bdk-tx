@@ -1,4 +1,4 @@
-use crate::{PsbtParams, Selection};
+use crate::{PsbtParams, Selection, SetSequenceError};
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display};
 use miniscript::bitcoin::{
@@ -21,6 +21,11 @@ pub enum AntiFeeSnipingError {
     /// Inputs have absolute locktimes of mixed units (height + time). The
     /// transaction would fail to build; fix the inputs before applying AFS.
     LockTypeMismatch,
+    /// The taproot input chosen for the sequence branch already requires a
+    /// stronger relative-timelock than AFS's freshness signal would provide.
+    /// Pre-filter taproot inputs to avoid this, or rely on the locktime
+    /// branch.
+    InputSequence(SetSequenceError),
 }
 
 impl Display for AntiFeeSnipingError {
@@ -37,6 +42,7 @@ impl Display for AntiFeeSnipingError {
             AntiFeeSnipingError::LockTypeMismatch => {
                 write!(f, "inputs have locktimes of mixed units")
             }
+            AntiFeeSnipingError::InputSequence(e) => Display::fmt(e, f),
         }
     }
 }
@@ -182,7 +188,9 @@ impl Selection {
                     .max(MIN_SEQUENCE_VALUE);
             }
 
-            self.inputs[input_index].set_sequence(Sequence(sequence_value));
+            self.inputs[input_index]
+                .set_sequence(Sequence(sequence_value))
+                .map_err(AntiFeeSnipingError::InputSequence)?;
         }
 
         Ok(())

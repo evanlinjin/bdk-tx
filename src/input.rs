@@ -39,7 +39,13 @@ impl ConfirmationStatus {
 
 #[derive(Debug, Clone)]
 enum PlanOrPsbtInput {
-    Plan(Box<Plan>),
+    Plan {
+        plan: Box<Plan>,
+        /// User-supplied override for the sequence value this input
+        /// contributes to the transaction. When `Some`, takes precedence
+        /// over the value derived from `plan.relative_timelock`.
+        sequence_override: Option<Sequence>,
+    },
     PsbtInput {
         psbt_input: Box<psbt::Input>,
         sequence: Sequence,
@@ -71,7 +77,7 @@ impl PlanOrPsbtInput {
 
     pub fn plan(&self) -> Option<&Plan> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => Some(plan),
+            PlanOrPsbtInput::Plan { plan, .. } => Some(plan),
             _ => None,
         }
     }
@@ -85,7 +91,7 @@ impl PlanOrPsbtInput {
 
     pub fn absolute_timelock(&self) -> Option<absolute::LockTime> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.absolute_timelock,
+            PlanOrPsbtInput::Plan { plan, .. } => plan.absolute_timelock,
             PlanOrPsbtInput::PsbtInput {
                 absolute_timelock, ..
             } => Some(*absolute_timelock),
@@ -94,21 +100,24 @@ impl PlanOrPsbtInput {
 
     pub fn relative_timelock(&self) -> Option<relative::LockTime> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.relative_timelock,
+            PlanOrPsbtInput::Plan { plan, .. } => plan.relative_timelock,
             PlanOrPsbtInput::PsbtInput { sequence, .. } => sequence.to_relative_lock_time(),
         }
     }
 
     pub fn sequence(&self) -> Option<bitcoin::Sequence> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.relative_timelock.map(|rtl| rtl.to_sequence()),
+            PlanOrPsbtInput::Plan {
+                plan,
+                sequence_override,
+            } => sequence_override.or_else(|| plan.relative_timelock.map(|rtl| rtl.to_sequence())),
             PlanOrPsbtInput::PsbtInput { sequence, .. } => Some(*sequence),
         }
     }
 
     pub fn satisfaction_weight(&self) -> usize {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.satisfaction_weight(),
+            PlanOrPsbtInput::Plan { plan, .. } => plan.satisfaction_weight(),
             PlanOrPsbtInput::PsbtInput {
                 satisfaction_weight,
                 ..
@@ -118,7 +127,7 @@ impl PlanOrPsbtInput {
 
     pub fn is_segwit(&self) -> bool {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.witness_version().is_some(),
+            PlanOrPsbtInput::Plan { plan, .. } => plan.witness_version().is_some(),
             PlanOrPsbtInput::PsbtInput { psbt_input, .. } => {
                 psbt_input.final_script_witness.is_some()
             }
@@ -127,7 +136,7 @@ impl PlanOrPsbtInput {
 
     pub fn tx(&self) -> Option<&Transaction> {
         match self {
-            PlanOrPsbtInput::Plan(_) => None,
+            PlanOrPsbtInput::Plan { .. } => None,
             PlanOrPsbtInput::PsbtInput { psbt_input, .. } => psbt_input.non_witness_utxo.as_ref(),
         }
     }
@@ -188,6 +197,35 @@ impl fmt::Display for FromPsbtInputError {
 #[cfg(feature = "std")]
 impl std::error::Error for FromPsbtInputError {}
 
+/// Error from [`Input::set_sequence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetSequenceError {
+    /// The new sequence value would not satisfy the input's relative-timelock
+    /// requirement under BIP68 / CSV.
+    IncompatibleRelativeTimelock {
+        /// The relative-timelock the input currently requires.
+        required: relative::LockTime,
+        /// The sequence value that was attempted.
+        new: Sequence,
+    },
+}
+
+impl fmt::Display for SetSequenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IncompatibleRelativeTimelock { required, new } => write!(
+                f,
+                "sequence {} does not satisfy required relative locktime {}",
+                new.to_consensus_u32(),
+                required,
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SetSequenceError {}
+
 /// Single-input plan.
 #[derive(Debug, Clone)]
 pub struct Input {
@@ -197,7 +235,6 @@ pub struct Input {
     plan: PlanOrPsbtInput,
     status: Option<ConfirmationStatus>,
     is_coinbase: bool,
-    sequence_override: Option<Sequence>,
 }
 
 impl Input {
@@ -222,10 +259,12 @@ impl Input {
             prev_outpoint: OutPoint::new(tx.compute_txid(), output_index as _),
             prev_txout: tx.tx_out(output_index).cloned()?,
             prev_tx: Some(tx),
-            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
+            plan: PlanOrPsbtInput::Plan {
+                plan: Box::new(plan),
+                sequence_override: None,
+            },
             status,
             is_coinbase,
-            sequence_override: None,
         })
     }
 
@@ -241,10 +280,12 @@ impl Input {
             prev_outpoint,
             prev_txout,
             prev_tx: None,
-            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
+            plan: PlanOrPsbtInput::Plan {
+                plan: Box::new(plan),
+                sequence_override: None,
+            },
             status,
             is_coinbase,
-            sequence_override: None,
         }
     }
 
@@ -307,7 +348,6 @@ impl Input {
             plan,
             status,
             is_coinbase,
-            sequence_override: None,
         })
     }
 
@@ -495,11 +535,8 @@ impl Input {
     }
 
     /// Sequence value.
-    ///
-    /// If a sequence override has been set via [`Input::set_sequence`], it is
-    /// returned. Otherwise the value is derived from the plan or PSBT input.
     pub fn sequence(&self) -> Option<bitcoin::Sequence> {
-        self.sequence_override.or_else(|| self.plan.sequence())
+        self.plan.sequence()
     }
 
     /// Override the sequence value this input contributes to the resulting tx.
@@ -507,13 +544,32 @@ impl Input {
     /// Useful for BIP326 anti-fee-sniping freshness signals (typically used
     /// via [`Selection::apply_anti_fee_sniping`]).
     ///
-    /// The caller is responsible for ensuring this is compatible with the
-    /// input's plan-required relative timelock, if any: setting a value below
-    /// the required relative locktime would make the transaction invalid.
+    /// # Errors
+    ///
+    /// Returns [`SetSequenceError::IncompatibleRelativeTimelock`] when the
+    /// new sequence would not satisfy the input's existing relative-timelock
+    /// requirement (from its plan or stored PSBT sequence). A weaker
+    /// override would make the transaction invalid under BIP68 / CSV.
     ///
     /// [`Selection::apply_anti_fee_sniping`]: crate::Selection::apply_anti_fee_sniping
-    pub fn set_sequence(&mut self, sequence: bitcoin::Sequence) {
-        self.sequence_override = Some(sequence);
+    pub fn set_sequence(&mut self, sequence: bitcoin::Sequence) -> Result<(), SetSequenceError> {
+        if let Some(required) = self.plan.relative_timelock() {
+            if !required.is_implied_by_sequence(sequence) {
+                return Err(SetSequenceError::IncompatibleRelativeTimelock {
+                    required,
+                    new: sequence,
+                });
+            }
+        }
+        match &mut self.plan {
+            PlanOrPsbtInput::Plan {
+                sequence_override, ..
+            } => *sequence_override = Some(sequence),
+            PlanOrPsbtInput::PsbtInput {
+                sequence: stored, ..
+            } => *stored = sequence,
+        }
+        Ok(())
     }
 
     /// The weight in witness units needed for satisfying the [`Input`].
@@ -682,5 +738,93 @@ impl InputGroup {
     /// Whether any contained input is a segwit spend.
     pub fn is_segwit(&self) -> bool {
         self.inputs().iter().any(|input| input.is_segwit())
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{secp256k1::Secp256k1, transaction, Amount, Sequence, Transaction, TxIn, TxOut};
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+
+    fn input_with_older(older_blocks: u16) -> anyhow::Result<Input> {
+        let secp = Secp256k1::new();
+        let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+        let rtl = relative::LockTime::from_height(older_blocks);
+        let desc_str = format!("wsh(and_v(v:pk({pk}),older({older_blocks})))");
+        let desc_pk: DescriptorPublicKey = pk.parse()?;
+        let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
+        let plan = desc
+            .at_derivation_index(0)?
+            .plan(&Assets::new().add(desc_pk).older(rtl))
+            .expect("plan with older() should be satisfiable");
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.at_derivation_index(0)?.script_pubkey(),
+                value: Amount::ONE_BTC,
+            }],
+        };
+        Ok(Input::from_prev_tx(plan, prev_tx, 0, None)?)
+    }
+
+    #[test]
+    fn test_set_sequence_accepts_satisfying_value() -> anyhow::Result<()> {
+        // Plan requires `older(100)`. A sequence of 100 satisfies it; 200 does too.
+        let mut input = input_with_older(100)?;
+        input.set_sequence(Sequence(100))?;
+        assert_eq!(input.sequence(), Some(Sequence(100)));
+        input.set_sequence(Sequence(200))?;
+        assert_eq!(input.sequence(), Some(Sequence(200)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_sequence_rejects_weaker_value() -> anyhow::Result<()> {
+        // Plan requires `older(100)`. A sequence of 50 must be rejected.
+        let mut input = input_with_older(100)?;
+        let result = input.set_sequence(Sequence(50));
+        assert!(
+            matches!(
+                result,
+                Err(SetSequenceError::IncompatibleRelativeTimelock { new, .. })
+                    if new == Sequence(50)
+            ),
+            "expected IncompatibleRelativeTimelock, got {:?}",
+            result
+        );
+        // The plan-derived default should still be the required value.
+        assert_eq!(input.sequence().map(|s| s.to_consensus_u32()), Some(100u32),);
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_sequence_accepts_any_value_without_relative_timelock() -> anyhow::Result<()> {
+        // A simple pk descriptor has no relative timelock; any sequence is fine.
+        let secp = Secp256k1::new();
+        let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+        let desc_pk: DescriptorPublicKey = pk.parse()?;
+        let (desc, _) = Descriptor::parse_descriptor(&secp, &format!("wpkh({pk})"))?;
+        let plan = desc
+            .at_derivation_index(0)?
+            .plan(&Assets::new().add(desc_pk))
+            .unwrap();
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.at_derivation_index(0)?.script_pubkey(),
+                value: Amount::ONE_BTC,
+            }],
+        };
+        let mut input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
+        // No relative timelock — anything goes, including very small values.
+        input.set_sequence(Sequence(1))?;
+        assert_eq!(input.sequence(), Some(Sequence(1)));
+        Ok(())
     }
 }
