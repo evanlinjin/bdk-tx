@@ -45,6 +45,10 @@ enum PlanOrPsbtInput {
         /// contributes to the transaction. When `Some`, takes precedence
         /// over the value derived from `plan.relative_timelock`.
         sequence_override: Option<Sequence>,
+        /// User-supplied sighash type for this input. `None` (the default)
+        /// means "don't write a sighash to the PSBT input" — the signer
+        /// will use `SIGHASH_ALL` implicitly. Set via [`Input::set_sighash_type`].
+        sighash: Option<psbt::PsbtSighashType>,
     },
     PsbtInput {
         psbt_input: Box<psbt::Input>,
@@ -110,6 +114,7 @@ impl PlanOrPsbtInput {
             PlanOrPsbtInput::Plan {
                 plan,
                 sequence_override,
+                ..
             } => sequence_override.or_else(|| plan.relative_timelock.map(|rtl| rtl.to_sequence())),
             PlanOrPsbtInput::PsbtInput { sequence, .. } => Some(*sequence),
         }
@@ -262,6 +267,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan {
                 plan: Box::new(plan),
                 sequence_override: None,
+                sighash: None,
             },
             status,
             is_coinbase,
@@ -283,6 +289,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan {
                 plan: Box::new(plan),
                 sequence_override: None,
+                sighash: None,
             },
             status,
             is_coinbase,
@@ -572,6 +579,36 @@ impl Input {
         Ok(())
     }
 
+    /// Sighash type to use when signing this input.
+    ///
+    /// For plan-backed inputs, returns the value set via [`Input::set_sighash_type`]
+    /// (or `None` if unset, which the signer treats as `SIGHASH_ALL`). For
+    /// PSBT-input-backed inputs, returns the value embedded in the underlying
+    /// [`psbt::Input::sighash_type`].
+    pub fn sighash_type(&self) -> Option<psbt::PsbtSighashType> {
+        match &self.plan {
+            PlanOrPsbtInput::Plan { sighash, .. } => *sighash,
+            PlanOrPsbtInput::PsbtInput { psbt_input, .. } => psbt_input.sighash_type,
+        }
+    }
+
+    /// Set the sighash type used when signing this input.
+    ///
+    /// Useful for advanced workflows (atomic swaps, coordinated txs, etc.)
+    /// that need non-default sighash flags like `SIGHASH_NONE`,
+    /// `SIGHASH_SINGLE`, or `ANYONECANPAY` variants. The default (no call,
+    /// or `None` here) leaves the signer to use `SIGHASH_ALL`.
+    pub fn set_sighash_type(&mut self, sighash: Option<psbt::PsbtSighashType>) {
+        match &mut self.plan {
+            PlanOrPsbtInput::Plan {
+                sighash: stored, ..
+            } => *stored = sighash,
+            PlanOrPsbtInput::PsbtInput { psbt_input, .. } => {
+                psbt_input.sighash_type = sighash;
+            }
+        }
+    }
+
     /// The weight in witness units needed for satisfying the [`Input`].
     ///
     /// The satisfaction weight is the combined size of the fully satisfied input's witness
@@ -825,6 +862,21 @@ mod tests {
         // No relative timelock — anything goes, including very small values.
         input.set_sequence(Sequence(1))?;
         assert_eq!(input.sequence(), Some(Sequence(1)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_sighash_type() -> anyhow::Result<()> {
+        // Default is None; set_sighash_type writes through; clearing via None works.
+        let mut input = input_with_older(50)?;
+        assert_eq!(input.sighash_type(), None);
+
+        let sighash = bitcoin::psbt::PsbtSighashType::from_u32(0x02); // SIGHASH_NONE
+        input.set_sighash_type(Some(sighash));
+        assert_eq!(input.sighash_type(), Some(sighash));
+
+        input.set_sighash_type(None);
+        assert_eq!(input.sighash_type(), None);
         Ok(())
     }
 }

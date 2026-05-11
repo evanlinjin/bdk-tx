@@ -77,14 +77,6 @@ pub struct PsbtParams {
     ///
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
-
-    /// Sighash type to be used for each input.
-    ///
-    /// This option only applies to [`Input`]s that include a plan, as otherwise the given PSBT
-    /// input can be expected to set a specific sighash type. Defaults to `None` which will not
-    /// set an explicit sighash type for any input. (In that case the sighash will typically
-    /// cover all of the outputs).
-    pub sighash_type: Option<bitcoin::psbt::PsbtSighashType>,
 }
 
 impl Default for PsbtParams {
@@ -94,7 +86,6 @@ impl Default for PsbtParams {
             min_locktime: absolute::LockTime::ZERO,
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
-            sighash_type: None,
         }
     }
 }
@@ -252,7 +243,7 @@ impl Selection {
                     }
                 }
 
-                psbt_input.sighash_type = params.sighash_type;
+                psbt_input.sighash_type = plan_input.sighash_type();
 
                 continue;
             }
