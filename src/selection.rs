@@ -8,7 +8,14 @@ use miniscript::psbt::PsbtExt;
 
 use crate::{Finalizer, Input, Output};
 
-const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+/// Default sequence value used for plan-based inputs that don't specify their own.
+///
+/// Matches Bitcoin Core's wallet default (`MAX_BIP125_RBF_SEQUENCE = 0xfffffffd`):
+/// BIP125-signaling and lock_time-respecting. With Bitcoin Core 28+ defaulting
+/// to Full RBF, the BIP125 signal is no longer load-bearing for replaceability,
+/// but signaling explicitly is what virtually every modern wallet does and what
+/// downstream tooling (block explorers, fee-bumping UIs) gates on.
+const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
 
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
@@ -31,6 +38,11 @@ pub struct PsbtParams {
     pub fallback_locktime: absolute::LockTime,
 
     /// [`Sequence`] value to use by default if not provided by the input.
+    ///
+    /// Defaults to [`Sequence::ENABLE_RBF_NO_LOCKTIME`] (0xfffffffd) to match
+    /// Bitcoin Core's wallet default (`MAX_BIP125_RBF_SEQUENCE`): BIP125-
+    /// signaling, lock_time-respecting. This is what callers almost always
+    /// want in 2026.
     pub fallback_sequence: Sequence,
 
     /// Whether to require the full tx, aka [`non_witness_utxo`] for segwit v0 inputs,
