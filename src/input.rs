@@ -197,6 +197,7 @@ pub struct Input {
     plan: PlanOrPsbtInput,
     status: Option<ConfirmationStatus>,
     is_coinbase: bool,
+    sequence_override: Option<Sequence>,
 }
 
 impl Input {
@@ -224,6 +225,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan(Box::new(plan)),
             status,
             is_coinbase,
+            sequence_override: None,
         })
     }
 
@@ -242,6 +244,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan(Box::new(plan)),
             status,
             is_coinbase,
+            sequence_override: None,
         }
     }
 
@@ -304,6 +307,7 @@ impl Input {
             plan,
             status,
             is_coinbase,
+            sequence_override: None,
         })
     }
 
@@ -491,8 +495,25 @@ impl Input {
     }
 
     /// Sequence value.
+    ///
+    /// If a sequence override has been set via [`Input::set_sequence`], it is
+    /// returned. Otherwise the value is derived from the plan or PSBT input.
     pub fn sequence(&self) -> Option<bitcoin::Sequence> {
-        self.plan.sequence()
+        self.sequence_override.or_else(|| self.plan.sequence())
+    }
+
+    /// Override the sequence value this input contributes to the resulting tx.
+    ///
+    /// Useful for BIP326 anti-fee-sniping freshness signals (typically used
+    /// via [`Selection::apply_anti_fee_sniping`]).
+    ///
+    /// The caller is responsible for ensuring this is compatible with the
+    /// input's plan-required relative timelock, if any: setting a value below
+    /// the required relative locktime would make the transaction invalid.
+    ///
+    /// [`Selection::apply_anti_fee_sniping`]: crate::Selection::apply_anti_fee_sniping
+    pub fn set_sequence(&mut self, sequence: bitcoin::Sequence) {
+        self.sequence_override = Some(sequence);
     }
 
     /// The weight in witness units needed for satisfying the [`Input`].

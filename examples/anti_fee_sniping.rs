@@ -88,16 +88,15 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let fallback_locktime: LockTime = LockTime::from_consensus(tip_height.to_consensus_u32());
-
-        let selection_inputs = selection.inputs.clone();
-
-        let psbt = selection.create_psbt(PsbtParams {
-            fallback_locktime,
+        let mut params = PsbtParams {
+            fallback_locktime: LockTime::ZERO,
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
-        })?;
-        let psbt = selection.apply_anti_fee_sniping(psbt, tip_height, &mut rand::thread_rng())?;
+        };
+        let mut selection = selection;
+        selection.apply_anti_fee_sniping(&mut params, tip_height, &mut rand::thread_rng())?;
+        let selection_inputs = selection.inputs.clone();
+        let psbt = selection.create_psbt(params)?;
 
         let tx = psbt.unsigned_tx;
 

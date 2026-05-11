@@ -20,7 +20,7 @@ mod selection;
 mod selector;
 mod signer;
 
-pub use anti_fee_sniping::{apply_anti_fee_sniping, AntiFeeSnipingError};
+pub use anti_fee_sniping::AntiFeeSnipingError;
 pub use canonical_unspents::*;
 pub use finalizer::*;
 pub use input::*;

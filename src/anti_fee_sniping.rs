@@ -1,32 +1,35 @@
-use crate::Input;
+use crate::{PsbtParams, Selection};
 use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display};
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
     transaction::Version,
-    Sequence, Transaction,
+    Sequence,
 };
 use rand_core::RngCore;
 
-/// Errors that can occur while applying [`apply_anti_fee_sniping`].
+/// Errors that can occur while applying [`Selection::apply_anti_fee_sniping`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntiFeeSnipingError {
-    /// Transaction `version` is below 2; BIP326 requires version >= 2.
+    /// `params.version` is below 2; BIP326 requires version >= 2.
     UnsupportedVersion(Version),
-    /// The transaction's existing `lock_time` is time-based (Unix timestamp),
+    /// The transaction's effective `lock_time` is time-based (Unix timestamp),
     /// which is incompatible with BIP326's height-based AFS. The caller should
-    /// either remove the time-based lock_time before calling, or skip AFS for
-    /// this transaction.
+    /// either remove the time-based fallback / time-based input CLTV, or skip
+    /// AFS for this transaction.
     TimeBasedLocktime(LockTime),
-    /// The transaction's existing `lock_time` is at a block height above the
+    /// The transaction's effective `lock_time` is at a block height above the
     /// supplied `tip`. Applying AFS at the tip would lower `lock_time` below
     /// an input-required CLTV. Use a `tip_height` >= the existing locktime.
     TipBelowExistingLocktime {
-        /// The transaction's current `lock_time` height.
+        /// The transaction's effective `lock_time` height.
         existing: absolute::Height,
         /// The supplied tip height.
         tip: absolute::Height,
     },
+    /// Inputs have absolute locktimes of mixed units (height + time). The
+    /// transaction would fail to build; fix the inputs before applying AFS.
+    LockTypeMismatch,
 }
 
 impl Display for AntiFeeSnipingError {
@@ -42,10 +45,13 @@ impl Display for AntiFeeSnipingError {
             ),
             AntiFeeSnipingError::TipBelowExistingLocktime { existing, tip } => write!(
                 f,
-                "tip height {} is below the transaction's existing lock_time {}",
+                "tip height {} is below the transaction's effective lock_time {}",
                 tip.to_consensus_u32(),
                 existing.to_consensus_u32(),
             ),
+            AntiFeeSnipingError::LockTypeMismatch => {
+                write!(f, "inputs have locktimes of mixed units")
+            }
         }
     }
 }
@@ -53,138 +59,151 @@ impl Display for AntiFeeSnipingError {
 #[cfg(feature = "std")]
 impl std::error::Error for AntiFeeSnipingError {}
 
-/// Applies BIP326 anti-fee-sniping (AFS) protection to a transaction.
-///
-/// AFS makes transaction-replay fee-sniping less profitable by signaling that
-/// the transaction is fresh. The function chooses one of two approaches:
-///
-/// - **nLockTime**: sets `tx.lock_time` to approximately `tip_height`.
-/// - **nSequence**: sets a randomly chosen Taproot input's `sequence` to
-///   approximately its confirmation depth.
-///
-/// A 10% chance applies a small 0..100 random offset to either signal, to
-/// avoid creating a unique fingerprint.
-///
-/// # Behavior contract
-///
-/// - The transaction's `version` must be >= 2.
-/// - The transaction's existing `lock_time` must be either zero or a block
-///   height at or below `tip_height`. Time-based existing lock_times are
-///   rejected; existing heights above the tip are rejected.
-/// - If the existing `lock_time` is non-zero (i.e. some input required a
-///   CLTV), the locktime branch is forced and the written value is clamped
-///   to `>= existing_height`. The sequence branch never runs in that case
-///   (it would zero `tx.lock_time` and erase the input-required CLTV).
-/// - `rbf_enabled` is derived from `tx.is_explicitly_rbf()` internally.
-///
-/// # Precondition
-///
-/// The caller must invoke this **before any signing**. Both `lock_time` and
-/// the rewritten taproot input's `sequence` are part of the BIP143/BIP341
-/// sighashes, so applying AFS after a partial sig has been added would
-/// silently invalidate that sig.
-///
-/// # See Also
-/// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
-pub fn apply_anti_fee_sniping(
-    tx: &mut Transaction,
-    inputs: &[Input],
-    tip_height: absolute::Height,
-    rng: &mut impl RngCore,
-) -> Result<(), AntiFeeSnipingError> {
-    const MAX_RELATIVE_HEIGHT: u32 = 65_535;
-    const FIFTY_PERCENT_PROBABILITY_RANGE: u32 = 2;
-    const MIN_SEQUENCE_VALUE: u32 = 1;
-    const TEN_PERCENT_PROBABILITY_RANGE: u32 = 10;
-    const MAX_RANDOM_OFFSET: u32 = 100;
+impl Selection {
+    /// Apply BIP326 anti-fee-sniping (AFS) to this selection and its build
+    /// parameters, **before** calling [`Selection::create_psbt`].
+    ///
+    /// AFS makes transaction-replay fee-sniping less profitable by signaling
+    /// that the transaction is fresh. The function chooses one of two
+    /// approaches:
+    ///
+    /// - **nLockTime**: rewrites `params.fallback_locktime` to approximately
+    ///   `tip_height`.
+    /// - **nSequence**: overrides one randomly chosen Taproot input's
+    ///   sequence to approximately its confirmation depth (via
+    ///   [`crate::Input::set_sequence`]).
+    ///
+    /// A 10% chance applies a small 0..100 random offset to either signal,
+    /// to avoid creating a unique fingerprint.
+    ///
+    /// # Behavior contract
+    ///
+    /// - `params.version` must be >= 2.
+    /// - The transaction's effective locktime (the value [`create_psbt`]
+    ///   would produce from the current `params.fallback_locktime` and any
+    ///   input-required CLTVs) must be a block height at or below
+    ///   `tip_height`. Time-based effective locktimes are rejected; existing
+    ///   heights above the tip are rejected.
+    /// - If the effective locktime is non-zero (i.e. some input required a
+    ///   CLTV), the locktime branch is forced and the written value is
+    ///   clamped to `>= effective_height`. The sequence branch never runs
+    ///   in that case (it would zero out the implicit locktime intent and
+    ///   erase the input-required CLTV).
+    ///
+    /// # Precondition
+    ///
+    /// This step modifies inputs and params before any PSBT is built and
+    /// signed, so no signatures can be silently invalidated by this call.
+    ///
+    /// [`create_psbt`]: Selection::create_psbt
+    ///
+    /// # See Also
+    /// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
+    pub fn apply_anti_fee_sniping(
+        &mut self,
+        params: &mut PsbtParams,
+        tip_height: absolute::Height,
+        rng: &mut impl RngCore,
+    ) -> Result<(), AntiFeeSnipingError> {
+        const MAX_RELATIVE_HEIGHT: u32 = 65_535;
+        const FIFTY_PERCENT_PROBABILITY_RANGE: u32 = 2;
+        const MIN_SEQUENCE_VALUE: u32 = 1;
+        const TEN_PERCENT_PROBABILITY_RANGE: u32 = 10;
+        const MAX_RANDOM_OFFSET: u32 = 100;
 
-    if tx.version < Version::TWO {
-        return Err(AntiFeeSnipingError::UnsupportedVersion(tx.version));
-    }
-
-    // Validate the existing tx.lock_time against tip_height.
-    let existing_height = match tx.lock_time {
-        LockTime::Blocks(h) => {
-            if h > tip_height {
-                return Err(AntiFeeSnipingError::TipBelowExistingLocktime {
-                    existing: h,
-                    tip: tip_height,
-                });
-            }
-            h
+        if params.version < Version::TWO {
+            return Err(AntiFeeSnipingError::UnsupportedVersion(params.version));
         }
-        LockTime::Seconds(_) => {
-            return Err(AntiFeeSnipingError::TimeBasedLocktime(tx.lock_time));
-        }
-    };
 
-    let rbf_enabled = tx.is_explicitly_rbf();
+        // Compute the effective locktime that create_psbt would produce.
+        let effective_locktime = Selection::accumulate_max_locktime(
+            self.inputs.iter().filter_map(|i| i.absolute_timelock()),
+            params.fallback_locktime,
+        )
+        .map_err(|_| AntiFeeSnipingError::LockTypeMismatch)?;
 
-    let taproot_inputs: Vec<(usize, &Input)> = tx
-        .input
-        .iter()
-        .enumerate()
-        .filter_map(|(vin, txin)| {
-            let input = inputs
-                .iter()
-                .find(|input| input.prev_outpoint() == txin.previous_output)?;
-            if input.prev_txout().script_pubkey.is_p2tr() {
-                Some((vin, input))
-            } else {
-                None
+        let effective_height = match effective_locktime {
+            LockTime::Blocks(h) => {
+                if h > tip_height {
+                    return Err(AntiFeeSnipingError::TipBelowExistingLocktime {
+                        existing: h,
+                        tip: tip_height,
+                    });
+                }
+                h
             }
-        })
-        .collect();
+            LockTime::Seconds(_) => {
+                return Err(AntiFeeSnipingError::TimeBasedLocktime(effective_locktime));
+            }
+        };
 
-    // The sequence branch zeroes tx.lock_time, which would erase any
-    // input-required CLTV. Force the locktime branch when existing > 0.
-    let preserve_existing_locktime = existing_height.to_consensus_u32() > 0;
-
-    let must_use_locktime = preserve_existing_locktime
-        || inputs.iter().any(|input| {
-            let confirmation = input.confirmations(tip_height);
-            confirmation == 0
-                || confirmation > MAX_RELATIVE_HEIGHT
-                || !input.prev_txout().script_pubkey.is_p2tr()
+        // Predict the rbf-enabled status from what create_psbt would write.
+        let rbf_enabled = self.inputs.iter().any(|input| {
+            input
+                .sequence()
+                .unwrap_or(params.fallback_sequence)
+                .to_consensus_u32()
+                < 0xfffffffe
         });
 
-    let use_locktime = !rbf_enabled
-        || must_use_locktime
-        || taproot_inputs.is_empty()
-        || random_probability(rng, FIFTY_PERCENT_PROBABILITY_RANGE);
+        let taproot_inputs: Vec<usize> = self
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.prev_txout().script_pubkey.is_p2tr())
+            .map(|(i, _)| i)
+            .collect();
 
-    if use_locktime {
-        let mut locktime = tip_height.to_consensus_u32();
+        // The sequence branch implicitly assumes lock_time == 0. A non-zero
+        // effective_height means some input required a CLTV — must use the
+        // locktime branch so create_psbt's accumulate_max_locktime preserves
+        // that CLTV.
+        let preserve_existing_locktime = effective_height.to_consensus_u32() > 0;
 
-        if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
-            let random_offset = random_range(rng, MAX_RANDOM_OFFSET);
-            locktime = locktime.saturating_sub(random_offset);
+        let must_use_locktime = preserve_existing_locktime
+            || self.inputs.iter().any(|input| {
+                let confirmation = input.confirmations(tip_height);
+                confirmation == 0
+                    || confirmation > MAX_RELATIVE_HEIGHT
+                    || !input.prev_txout().script_pubkey.is_p2tr()
+            });
+
+        let use_locktime = !rbf_enabled
+            || must_use_locktime
+            || taproot_inputs.is_empty()
+            || random_probability(rng, FIFTY_PERCENT_PROBABILITY_RANGE);
+
+        if use_locktime {
+            let mut locktime = tip_height.to_consensus_u32();
+
+            if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
+                let random_offset = random_range(rng, MAX_RANDOM_OFFSET);
+                locktime = locktime.saturating_sub(random_offset);
+            }
+
+            // Never write below the effective locktime — preserves CLTV.
+            locktime = locktime.max(effective_height.to_consensus_u32());
+
+            params.fallback_locktime =
+                LockTime::from_height(locktime).expect("must be valid Height");
+        } else {
+            let random_index = random_range(rng, taproot_inputs.len() as u32);
+            let input_index = taproot_inputs[random_index as usize];
+            let confirmation = self.inputs[input_index].confirmations(tip_height);
+
+            let mut sequence_value = confirmation;
+            if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
+                let random_offset = random_range(rng, MAX_RANDOM_OFFSET);
+                sequence_value = sequence_value
+                    .saturating_sub(random_offset)
+                    .max(MIN_SEQUENCE_VALUE);
+            }
+
+            self.inputs[input_index].set_sequence(Sequence(sequence_value));
         }
 
-        // Never write below the existing locktime — preserves input-required CLTV.
-        locktime = locktime.max(existing_height.to_consensus_u32());
-
-        tx.lock_time = LockTime::from_height(locktime).expect("must be valid Height");
-    } else {
-        // existing_height is 0 here (otherwise must_use_locktime is true), so
-        // this assignment is a no-op preserving BIP326 spec wording.
-        tx.lock_time = LockTime::ZERO;
-        let random_index = random_range(rng, taproot_inputs.len() as u32);
-        let (input_index, input) = taproot_inputs[random_index as usize];
-        let confirmation = input.confirmations(tip_height);
-
-        let mut sequence_value = confirmation;
-        if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
-            let random_offset = random_range(rng, MAX_RANDOM_OFFSET);
-            sequence_value = sequence_value
-                .saturating_sub(random_offset)
-                .max(MIN_SEQUENCE_VALUE);
-        }
-
-        tx.input[input_index].sequence = Sequence(sequence_value);
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Returns true with probability 1/n.
@@ -263,20 +282,19 @@ mod tests {
 
         while !used_locktime || !used_sequence {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-            let selection = Selection {
+            let mut selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![output],
             };
-            let psbt = selection
-                .create_psbt(PsbtParams {
-                    fallback_locktime: LockTime::ZERO,
-                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    ..Default::default()
-                })
+            let mut params = PsbtParams {
+                fallback_locktime: LockTime::ZERO,
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            };
+            selection
+                .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
-            let psbt = selection
-                .apply_anti_fee_sniping(psbt, tip_height, &mut OsRng)
-                .unwrap();
+            let psbt = selection.create_psbt(params.clone()).unwrap();
             let tx = psbt.unsigned_tx;
 
             if tx.lock_time > LockTime::ZERO {
@@ -284,8 +302,11 @@ mod tests {
                 let locktime_value = tx.lock_time.to_consensus_u32();
                 let min_height = current_height.saturating_sub(100);
                 assert!((min_height..=current_height).contains(&locktime_value));
-                assert!(locktime_value <= current_height);
-                assert!(locktime_value >= current_height.saturating_sub(100));
+                assert_eq!(
+                    locktime_value,
+                    params.fallback_locktime.to_consensus_u32(),
+                    "create_psbt should preserve the AFS-set fallback_locktime when no input requires a higher CLTV"
+                );
             } else {
                 used_sequence = true;
                 let sequence_value = tx.input[0].sequence.to_consensus_u32();
@@ -294,8 +315,11 @@ mod tests {
                 let min_sequence = confirmations.saturating_sub(100);
                 assert!((min_sequence..=confirmations).contains(&sequence_value));
                 assert!(sequence_value >= 1, "Sequence must be at least 1");
-                assert!(sequence_value <= confirmations);
-                assert!(sequence_value >= confirmations.saturating_sub(100));
+                // Selection's input must have its sequence override set.
+                assert_eq!(
+                    selection.inputs[0].sequence(),
+                    Some(Sequence(sequence_value))
+                );
             }
 
             loops += 1;
@@ -320,20 +344,19 @@ mod tests {
         let mut loops = 0;
 
         while !used_locktime || !used_sequence {
-            let selection = Selection {
+            let mut selection = Selection {
                 inputs: vec![input1.clone(), input2.clone(), input3.clone()],
                 outputs: vec![output.clone()],
             };
-            let psbt = selection
-                .create_psbt(PsbtParams {
-                    fallback_locktime: LockTime::ZERO,
-                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    ..Default::default()
-                })
+            let mut params = PsbtParams {
+                fallback_locktime: LockTime::ZERO,
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            };
+            selection
+                .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
-            let psbt = selection
-                .apply_anti_fee_sniping(psbt, tip_height, &mut OsRng)
-                .unwrap();
+            let psbt = selection.create_psbt(params).unwrap();
             let tx = psbt.unsigned_tx;
 
             if tx.lock_time > LockTime::ZERO {
@@ -356,22 +379,20 @@ mod tests {
 
     #[test]
     fn test_anti_fee_sniping_unsupported_version_error() {
-        let confirmation_height = 800_000;
-        let input = taproot_test_input(confirmation_height).unwrap();
-        let inputs = vec![input];
-        let tip_height = Height::from_consensus(confirmation_height + 50).unwrap();
-
-        let mut tx = Transaction {
-            version: Version::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: inputs[0].prev_outpoint(),
-                ..Default::default()
-            }],
-            output: vec![],
+        let input = taproot_test_input(800_000).unwrap();
+        let mut selection = Selection {
+            inputs: vec![input],
+            outputs: vec![],
         };
+        let mut params = PsbtParams {
+            version: Version::ONE,
+            fallback_locktime: LockTime::ZERO,
+            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        };
+        let tip_height = Height::from_consensus(800_050).unwrap();
 
-        let result = apply_anti_fee_sniping(&mut tx, &inputs, tip_height, &mut OsRng);
+        let result = selection.apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng);
         assert!(matches!(
             result,
             Err(AntiFeeSnipingError::UnsupportedVersion(_))
@@ -381,23 +402,20 @@ mod tests {
     #[test]
     fn test_anti_fee_sniping_time_based_locktime_error() {
         let input = taproot_test_input(800_000).unwrap();
-        let inputs = vec![input];
+        let mut selection = Selection {
+            inputs: vec![input],
+            outputs: vec![],
+        };
+        // A time-based fallback locktime makes the effective locktime time-based.
+        let time_locktime = LockTime::from_consensus(1_734_230_218);
+        let mut params = PsbtParams {
+            fallback_locktime: time_locktime,
+            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        };
         let tip_height = Height::from_consensus(800_050).unwrap();
 
-        // A time-based existing lock_time is incompatible with BIP326.
-        let time_locktime = LockTime::from_consensus(1_734_230_218);
-        let mut tx = Transaction {
-            version: Version::TWO,
-            lock_time: time_locktime,
-            input: vec![TxIn {
-                previous_output: inputs[0].prev_outpoint(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                ..Default::default()
-            }],
-            output: vec![],
-        };
-
-        let result = apply_anti_fee_sniping(&mut tx, &inputs, tip_height, &mut OsRng);
+        let result = selection.apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng);
         assert!(
             matches!(result, Err(AntiFeeSnipingError::TimeBasedLocktime(lt)) if lt == time_locktime),
             "expected TimeBasedLocktime error, got {:?}",
@@ -408,22 +426,19 @@ mod tests {
     #[test]
     fn test_anti_fee_sniping_tip_below_existing_error() {
         let input = taproot_test_input(800_000).unwrap();
-        let inputs = vec![input];
-        let tip_height = Height::from_consensus(800_050).unwrap();
-        let existing = Height::from_consensus(800_060).unwrap();
-
-        let mut tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::Blocks(existing),
-            input: vec![TxIn {
-                previous_output: inputs[0].prev_outpoint(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                ..Default::default()
-            }],
-            output: vec![],
+        let mut selection = Selection {
+            inputs: vec![input],
+            outputs: vec![],
         };
+        let existing = Height::from_consensus(800_060).unwrap();
+        let mut params = PsbtParams {
+            fallback_locktime: LockTime::Blocks(existing),
+            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        };
+        let tip_height = Height::from_consensus(800_050).unwrap();
 
-        let result = apply_anti_fee_sniping(&mut tx, &inputs, tip_height, &mut OsRng);
+        let result = selection.apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng);
         assert!(
             matches!(
                 result,
@@ -437,85 +452,73 @@ mod tests {
 
     #[test]
     fn test_anti_fee_sniping_locktime_clamp_preserves_input_cltv() {
-        // existing tx.lock_time is at exactly tip - 50: any random offset >= 50
-        // would underflow it. Across many iterations, AFS must never write
-        // below the existing locktime.
+        // params.fallback_locktime is at exactly tip - 50: any random offset
+        // >= 50 would underflow it. Across many iterations, AFS must never
+        // write below the effective locktime.
         let tip = 1_000_000u32;
         let existing = tip - 50;
         let confirmation_height = tip - 10;
         let input = taproot_test_input(confirmation_height).unwrap();
-        let inputs = vec![input];
         let tip_height = Height::from_consensus(tip).unwrap();
 
         for _ in 0..200 {
-            let mut tx = Transaction {
-                version: Version::TWO,
-                lock_time: LockTime::from_height(existing).unwrap(),
-                input: vec![TxIn {
-                    previous_output: inputs[0].prev_outpoint(),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    ..Default::default()
-                }],
-                output: vec![],
+            let mut selection = Selection {
+                inputs: vec![input.clone()],
+                outputs: vec![],
             };
-
-            apply_anti_fee_sniping(&mut tx, &inputs, tip_height, &mut OsRng).unwrap();
-
-            // Must always be locktime branch: existing > 0 forces it.
-            assert!(tx.lock_time > LockTime::ZERO);
+            let mut params = PsbtParams {
+                fallback_locktime: LockTime::from_height(existing).unwrap(),
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            };
+            selection
+                .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
+                .unwrap();
+            // Existing > 0 forces the locktime branch.
+            assert!(params.fallback_locktime > LockTime::ZERO);
             assert!(
-                tx.lock_time.to_consensus_u32() >= existing,
+                params.fallback_locktime.to_consensus_u32() >= existing,
                 "AFS wrote {} below existing CLTV {}",
-                tx.lock_time.to_consensus_u32(),
+                params.fallback_locktime.to_consensus_u32(),
                 existing,
             );
-            assert!(tx.lock_time.to_consensus_u32() <= tip);
+            assert!(params.fallback_locktime.to_consensus_u32() <= tip);
+            // No input sequence override should have been set.
+            assert!(selection.inputs[0].sequence().is_none());
         }
     }
 
     #[test]
-    fn test_selection_apply_anti_fee_sniping_owned_in_owned_out() {
-        // Smoke test: the wrapper takes a Psbt and returns a Psbt, mutating
-        // either lock_time or a sequence value across iterations.
+    fn test_apply_anti_fee_sniping_is_mutating_and_idempotent_via_create_psbt() {
+        // Smoke test: applying AFS mutates Selection or PsbtParams, and the
+        // result is consumed by create_psbt deterministically.
         let current_height = 2_500;
         let input = taproot_test_input(2_000).unwrap();
         let tip_height = Height::from_consensus(current_height).unwrap();
 
         let mut at_least_one_change = false;
         for _ in 0..10 {
-            let selection = Selection {
+            let mut selection = Selection {
                 inputs: vec![input.clone()],
                 outputs: vec![Output::with_script(
                     ScriptBuf::new(),
                     Amount::from_sat(9_000),
                 )],
             };
-            let psbt = selection
-                .create_psbt(PsbtParams {
-                    fallback_locktime: LockTime::ZERO,
-                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    ..Default::default()
-                })
-                .unwrap();
-            let original_lt = psbt.unsigned_tx.lock_time;
-            let original_seqs: Vec<u32> = psbt
-                .unsigned_tx
-                .input
-                .iter()
-                .map(|i| i.sequence.to_consensus_u32())
-                .collect();
+            let mut params = PsbtParams {
+                fallback_locktime: LockTime::ZERO,
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            };
+            let original_lt = params.fallback_locktime;
+            let original_seq = selection.inputs[0].sequence();
 
-            let psbt = selection
-                .apply_anti_fee_sniping(psbt, tip_height, &mut OsRng)
+            selection
+                .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
                 .unwrap();
 
-            let new_seqs: Vec<u32> = psbt
-                .unsigned_tx
-                .input
-                .iter()
-                .map(|i| i.sequence.to_consensus_u32())
-                .collect();
-            if psbt.unsigned_tx.lock_time != original_lt || new_seqs != original_seqs {
+            let new_seq = selection.inputs[0].sequence();
+            if params.fallback_locktime != original_lt || new_seq != original_seq {
                 at_least_one_change = true;
                 break;
             }

@@ -5,9 +5,8 @@ use core::fmt::{Debug, Display};
 use miniscript::bitcoin;
 use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
-use rand_core::RngCore;
 
-use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, Output};
+use crate::{Finalizer, Input, Output};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
 
@@ -107,7 +106,7 @@ impl Selection {
     /// Returns the `fallback_locktime` if the locktimes iterator is empty, `Ok(lock_time)` with
     /// the maximum locktime if all items share the same unit. Errors if there is a mismatch of
     /// lock type units among the required locktimes.
-    fn accumulate_max_locktime(
+    pub(crate) fn accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
         fallback_locktime: absolute::LockTime,
     ) -> Result<absolute::LockTime, CreatePsbtError> {
@@ -214,23 +213,6 @@ impl Selection {
             }
         }
 
-        Ok(psbt)
-    }
-
-    /// Apply BIP326 anti-fee-sniping to a PSBT.
-    ///
-    /// This is sugar over [`apply_anti_fee_sniping`]: it mutates
-    /// `psbt.unsigned_tx` and returns the PSBT. **Must be called before any
-    /// signing** — both `lock_time` and the rewritten taproot input's
-    /// `sequence` are part of the BIP143/BIP341 sighashes, so applying AFS
-    /// after a partial sig would silently invalidate it.
-    pub fn apply_anti_fee_sniping(
-        &self,
-        mut psbt: Psbt,
-        tip_height: absolute::Height,
-        rng: &mut impl RngCore,
-    ) -> Result<Psbt, AntiFeeSnipingError> {
-        apply_anti_fee_sniping(&mut psbt.unsigned_tx, &self.inputs, tip_height, rng)?;
         Ok(psbt)
     }
 
