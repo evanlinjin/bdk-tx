@@ -85,21 +85,42 @@ impl Default for PsbtBuildParams {
 /// own plan requirement, an explicit override, or the fallback). Per-input
 /// sighash overrides remain on the [`Input`] itself.
 ///
-/// Marked `#[non_exhaustive]` so external crates cannot bypass the
-/// [`Selection::into_template`] resolution flow by struct-literal
-/// construction.
+/// Marked `#[non_exhaustive]` with `pub(crate)` fields so external crates
+/// can only obtain a `TxTemplate` via [`Selection::into_template`], and
+/// can only mutate it through validated methods
+/// ([`TxTemplate::apply_anti_fee_sniping`],
+/// [`TxTemplate::shuffle_inputs`], [`TxTemplate::shuffle_outputs`]).
+/// External callers read via the field accessors below.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TxTemplate {
+    pub(crate) version: transaction::Version,
+    pub(crate) lock_time: absolute::LockTime,
+    pub(crate) inputs: Vec<Input>,
+    pub(crate) outputs: Vec<Output>,
+}
+
+impl TxTemplate {
     /// Resolved tx version.
-    pub version: transaction::Version,
+    pub fn version(&self) -> transaction::Version {
+        self.version
+    }
+
     /// Resolved tx lock_time.
-    pub lock_time: absolute::LockTime,
+    pub fn lock_time(&self) -> absolute::LockTime {
+        self.lock_time
+    }
+
     /// Inputs in the resulting tx. Each input's sequence is resolved
     /// (`input.sequence()` returns `Some(_)` for all).
-    pub inputs: Vec<Input>,
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
+
     /// Outputs in the resulting tx.
-    pub outputs: Vec<Output>,
+    pub fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
 }
 
 impl Selection {

@@ -6,12 +6,13 @@ use crate::{Finalizer, Input, Output};
 
 /// Final selection of inputs and outputs.
 ///
-/// Marked `#[non_exhaustive]` so external crates cannot bypass the structural
-/// validation performed by [`Selector::new`] (notably the locktime-unit
-/// consistency check). All publicly-reachable code paths that produce a
-/// `Selection` route through [`Selector`], so downstream stages
-/// ([`Selection::into_template`], [`crate::TxTemplate::into_psbt`]) can rely
-/// on those invariants.
+/// Marked `#[non_exhaustive]` with `pub(crate)` fields so external crates
+/// can only obtain a `Selection` via [`Selector`]'s validated path. All
+/// publicly-reachable code paths that produce a `Selection` route through
+/// [`Selector`], so downstream stages ([`Selection::into_template`],
+/// [`crate::TxTemplate::create_psbt`]) can rely on those invariants.
+///
+/// External callers read via [`Selection::inputs`] and [`Selection::outputs`].
 ///
 /// [`Selector`]: crate::Selector
 /// [`Selector::new`]: crate::Selector::new
@@ -19,10 +20,20 @@ use crate::{Finalizer, Input, Output};
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Selection {
+    pub(crate) inputs: Vec<Input>,
+    pub(crate) outputs: Vec<Output>,
+}
+
+impl Selection {
     /// Inputs in this selection.
-    pub inputs: Vec<Input>,
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
+
     /// Outputs in this selection.
-    pub outputs: Vec<Output>,
+    pub fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
 }
 
 impl Selection {
