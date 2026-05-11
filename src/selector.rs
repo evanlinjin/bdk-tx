@@ -347,6 +347,12 @@ pub enum SelectorError {
     CannotMeetTarget(CannotMeetTarget),
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
+    /// Input candidates have absolute timelocks of mixed units (some
+    /// block-height-based, others time-based). Such a set is unbuildable —
+    /// `tx.lock_time` is a single field that must be one unit or the other.
+    /// Filter the [`InputCandidates`] down to a single-unit subset before
+    /// constructing the [`Selector`].
+    LockTypeMismatch,
 }
 
 impl fmt::Display for SelectorError {
@@ -356,6 +362,9 @@ impl fmt::Display for SelectorError {
             Self::CannotMeetTarget(err) => write!(f, "{err}"),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
+            }
+            Self::LockTypeMismatch => {
+                write!(f, "input candidates have absolute timelocks of mixed units")
             }
         }
     }
@@ -371,6 +380,10 @@ impl<'c> Selector<'c> {
     ///
     /// - If we are unable to create a change policy from the `params`.
     /// - If the target is unreachable given the total input value.
+    /// - If the input candidates have absolute timelocks of mixed units
+    ///   (some block-height-based, others time-based). Filter the
+    ///   [`InputCandidates`] down to a single-unit subset before reaching
+    ///   this constructor.
     pub fn new(
         candidates: &'c InputCandidates,
         params: SelectorParams,
@@ -381,6 +394,23 @@ impl<'c> Selector<'c> {
         let change_script = params.change_script.source();
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
+        }
+
+        // Verify all input-required absolute timelocks agree on unit (height
+        // vs time). Downstream stages (create_psbt, apply_anti_fee_sniping)
+        // rely on this invariant; the Selection that comes out of this
+        // selector therefore needs no further validation.
+        let mut acc_unit: Option<bitcoin::absolute::LockTime> = None;
+        for input in candidates.inputs() {
+            if let Some(lt) = input.absolute_timelock() {
+                match acc_unit {
+                    Some(existing) if !existing.is_same_unit(lt) => {
+                        return Err(SelectorError::LockTypeMismatch);
+                    }
+                    None => acc_unit = Some(lt),
+                    _ => {}
+                }
+            }
         }
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
         if candidates.must_select().is_some() {

@@ -22,9 +22,6 @@ pub enum AntiFeeSnipingError {
     /// taproot+confirmed inputs in a v2 RBF-signaling tx, or skip AFS for
     /// this transaction.
     NoApplicableBranch(LockTime),
-    /// Inputs have absolute locktimes of mixed units (height + time). The
-    /// transaction would fail to build; fix the inputs before applying AFS.
-    LockTypeMismatch,
 }
 
 impl Display for AntiFeeSnipingError {
@@ -35,9 +32,6 @@ impl Display for AntiFeeSnipingError {
                 "anti-fee-sniping cannot apply: time-based lock_time {} blocks the locktime branch and the sequence branch is ineligible",
                 lt
             ),
-            AntiFeeSnipingError::LockTypeMismatch => {
-                write!(f, "inputs have locktimes of mixed units")
-            }
         }
     }
 }
@@ -129,8 +123,7 @@ impl Selection {
         let effective_locktime = Selection::accumulate_max_locktime(
             self.inputs.iter().filter_map(|i| i.absolute_timelock()),
             params.fallback_locktime,
-        )
-        .map_err(|_| AntiFeeSnipingError::LockTypeMismatch)?;
+        );
 
         // The locktime branch can only write a height-based value; a
         // time-based effective locktime makes its write a no-op (see

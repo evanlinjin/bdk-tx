@@ -18,6 +18,17 @@ use crate::{Finalizer, Input, Output};
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
 
 /// Final selection of inputs and outputs.
+///
+/// Marked `#[non_exhaustive]` so external crates cannot bypass the structural
+/// validation performed by [`Selector::new`] (notably the locktime-unit
+/// consistency check). All publicly-reachable code paths that produce a
+/// `Selection` route through [`Selector`], so downstream stages
+/// ([`Selection::create_psbt`], [`Selection::apply_anti_fee_sniping`]) can
+/// rely on those invariants.
+///
+/// [`Selector`]: crate::Selector
+/// [`Selector::new`]: crate::Selector::new
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct Selection {
     /// Inputs in this selection.
@@ -75,8 +86,6 @@ impl Default for PsbtParams {
 /// Occurs when creating a psbt fails.
 #[derive(Debug)]
 pub enum CreatePsbtError {
-    /// Attempted to mix locktime types.
-    LockTypeMismatch,
     /// Missing tx for legacy input.
     MissingFullTxForLegacyInput(Box<Input>),
     /// Missing tx for segwit v0 input.
@@ -90,7 +99,6 @@ pub enum CreatePsbtError {
 impl core::fmt::Display for CreatePsbtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            CreatePsbtError::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
                 f,
                 "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
@@ -115,27 +123,32 @@ impl std::error::Error for CreatePsbtError {}
 impl Selection {
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
-    /// Returns the `fallback_locktime` if the locktimes iterator is empty, `Ok(lock_time)` with
-    /// the maximum locktime if all items share the same unit. Errors if there is a mismatch of
-    /// lock type units among the required locktimes.
+    /// Returns the `fallback_locktime` if the locktimes iterator is empty, or the maximum
+    /// locktime if all items share the same unit. A different-unit fallback is intentionally
+    /// ignored so that e.g. a height-based fallback does not conflict with a time-based CLTV
+    /// requirement.
+    ///
+    /// # Panics
+    ///
+    /// Debug-panics if the iterator yields locktimes of mixed units. This invariant is
+    /// enforced upstream by [`Selector::new`][sel]; reaching this panic means a `Selection`
+    /// was constructed by some path that bypassed validation.
+    ///
+    /// [sel]: crate::Selector::new
     pub(crate) fn accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
         fallback_locktime: absolute::LockTime,
-    ) -> Result<absolute::LockTime, CreatePsbtError> {
-        // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is an error.
-        // The fallback is only used when it is compatible with the input requirements.
-        // If the fallback is a different unit from the required locktime it is
-        // intentionally ignored so that a height-based fallback does not conflict with a
-        // time-based CLTV requirement.
+    ) -> absolute::LockTime {
         let mut acc = Option::<absolute::LockTime>::None;
         for locktime in locktimes {
             match &mut acc {
-                Some(acc) => {
-                    if !acc.is_same_unit(locktime) {
-                        return Err(CreatePsbtError::LockTypeMismatch);
-                    }
-                    if acc.is_implied_by(locktime) {
-                        *acc = locktime;
+                Some(existing) => {
+                    debug_assert!(
+                        existing.is_same_unit(locktime),
+                        "Selector::new should have rejected mixed locktime units"
+                    );
+                    if existing.is_implied_by(locktime) {
+                        *existing = locktime;
                     }
                 }
                 acc => *acc = Some(locktime),
@@ -143,17 +156,17 @@ impl Selection {
         }
         match acc {
             // No required locktimes from inputs: use fallback directly.
-            None => Ok(fallback_locktime),
+            None => fallback_locktime,
             // Same unit as fallback: take the maximum of required and fallback.
             Some(lock_time) if lock_time.is_same_unit(fallback_locktime) => {
                 if lock_time.is_implied_by(fallback_locktime) {
-                    Ok(fallback_locktime)
+                    fallback_locktime
                 } else {
-                    Ok(lock_time)
+                    lock_time
                 }
             }
             // Fallback is a different unit: use required locktime and ignore fallback.
-            Some(lock_time) => Ok(lock_time),
+            Some(lock_time) => lock_time,
         }
     }
 
@@ -166,7 +179,7 @@ impl Selection {
                     .iter()
                     .filter_map(|input| input.absolute_timelock()),
                 params.fallback_locktime,
-            )?,
+            ),
             input: self
                 .inputs
                 .iter()
