@@ -11,8 +11,6 @@ use rand_core::RngCore;
 /// Errors that can occur while applying [`Selection::apply_anti_fee_sniping`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntiFeeSnipingError {
-    /// `params.version` is below 2; BIP326 requires version >= 2.
-    UnsupportedVersion(Version),
     /// The transaction's effective `lock_time` is time-based (Unix timestamp),
     /// which is incompatible with BIP326's height-based AFS. The caller should
     /// either remove the time-based fallback / time-based input CLTV, or skip
@@ -26,9 +24,6 @@ pub enum AntiFeeSnipingError {
 impl Display for AntiFeeSnipingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AntiFeeSnipingError::UnsupportedVersion(v) => {
-                write!(f, "anti-fee-sniping requires tx version >= 2, got {}", v)
-            }
             AntiFeeSnipingError::TimeBasedLocktime(lt) => write!(
                 f,
                 "anti-fee-sniping is incompatible with time-based lock_time {}",
@@ -63,7 +58,12 @@ impl Selection {
     ///
     /// # Behavior contract
     ///
-    /// - `params.version` must be >= 2.
+    /// - If `params.version` is below [`Version::TWO`], it is **bumped to
+    ///   `Version::TWO`** before AFS runs — BIP326 requires v2 semantics
+    ///   (relative-locktime via BIP68/CSV) for the sequence branch, and v1
+    ///   transactions have no modern wallet use case worth preserving here.
+    ///   If you need a specific lower version for some reason, do not call
+    ///   this function.
     /// - The transaction's effective locktime (the value [`create_psbt`]
     ///   would produce from the current `params.fallback_locktime` and any
     ///   input-required CLTVs) must be height-based. Time-based effective
@@ -99,8 +99,9 @@ impl Selection {
         const TEN_PERCENT_PROBABILITY_RANGE: u32 = 10;
         const MAX_RANDOM_OFFSET: u32 = 100;
 
+        // AFS requires v2 semantics; silently bump if needed (documented).
         if params.version < Version::TWO {
-            return Err(AntiFeeSnipingError::UnsupportedVersion(params.version));
+            params.version = Version::TWO;
         }
 
         // Compute the effective locktime that create_psbt would produce.
@@ -371,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_unsupported_version_error() {
+    fn test_anti_fee_sniping_bumps_version_to_two() {
         let input = taproot_test_input(800_000).unwrap();
         let mut selection = Selection {
             inputs: vec![input],
@@ -385,11 +386,10 @@ mod tests {
         };
         let tip_height = Height::from_consensus(800_050).unwrap();
 
-        let result = selection.apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng);
-        assert!(matches!(
-            result,
-            Err(AntiFeeSnipingError::UnsupportedVersion(_))
-        ));
+        selection
+            .apply_anti_fee_sniping(&mut params, tip_height, &mut OsRng)
+            .expect("AFS should auto-bump version to TWO");
+        assert_eq!(params.version, Version::TWO);
     }
 
     #[test]
