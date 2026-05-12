@@ -21,7 +21,7 @@ pub const FALLBACK_SEQUENCE: Sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
 /// template construction. Optional transformations (anti-fee-sniping,
 /// shuffling, etc.) are exposed as methods on [`TxTemplate`].
 #[derive(Debug, Clone)]
-pub struct TemplateParams {
+pub struct TxTemplateParams {
     /// Minimum tx version. Acts as a floor on `tx.version`:
     /// [`Selection::into_template`] bumps it to `Version::TWO` if any input
     /// requires CSV (BIP112), and [`TxTemplate::apply_anti_fee_sniping`]
@@ -46,7 +46,7 @@ pub struct TemplateParams {
     pub fallback_sequence: Sequence,
 }
 
-impl Default for TemplateParams {
+impl Default for TxTemplateParams {
     fn default() -> Self {
         Self {
             min_version: transaction::Version::TWO,
@@ -79,7 +79,7 @@ impl Default for PsbtBuildParams {
 /// A fully-resolved tx shape, intermediate between [`Selection`] and the
 /// final [`Psbt`] / [`bitcoin::Transaction`].
 ///
-/// All floors and defaults from [`TemplateParams`] have been resolved into
+/// All floors and defaults from [`TxTemplateParams`] have been resolved into
 /// concrete values: `version` and `lock_time` are the actual tx-level
 /// values, and each input's sequence has been set (either by the input's
 /// own plan requirement, an explicit override, or the fallback). Per-input
@@ -175,7 +175,7 @@ impl Selection {
     /// - For each input, if it has no sequence set (no plan-required
     ///   relative timelock, no [`Input::set_sequence`] override), the
     ///   `params.fallback_sequence` is applied.
-    pub fn into_template(self, params: TemplateParams) -> TxTemplate {
+    pub fn into_template(self, params: TxTemplateParams) -> TxTemplate {
         let inputs_require_v2 = self
             .inputs
             .iter()

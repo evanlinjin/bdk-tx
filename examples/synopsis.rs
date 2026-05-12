@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
-    SelectorParams, Signer, TemplateParams,
+    SelectorParams, Signer, TxTemplateParams,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         )?;
 
     let (mut psbt, finalizer) = selection
-        .into_template(TemplateParams::default())
+        .into_template(TxTemplateParams::default())
         .create_psbt(PsbtBuildParams::default())?;
 
     let _ = psbt.sign(&signer, &secp);
@@ -157,7 +157,7 @@ fn main() -> anyhow::Result<()> {
         );
 
         let (mut psbt, finalizer) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
         psbt.sign(&signer, &secp).expect("failed to sign");
         assert!(

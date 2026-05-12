@@ -2,7 +2,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
-    SelectorParams, TemplateParams,
+    SelectorParams, TxTemplateParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
 
         let selection_inputs = selection.inputs().to_vec();
         let (psbt, _) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
             .create_psbt(PsbtBuildParams::default())?;
 

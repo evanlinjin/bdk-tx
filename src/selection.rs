@@ -89,7 +89,7 @@ impl Selection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PsbtBuildParams, TemplateParams};
+    use crate::{PsbtBuildParams, TxTemplateParams};
     use bitcoin::{
         absolute::LockTime, secp256k1::Secp256k1, transaction, Amount, ScriptBuf, Transaction,
         TxIn, TxOut,
@@ -122,19 +122,19 @@ mod tests {
 
         struct TestCase {
             name: &'static str,
-            params: TemplateParams,
+            params: TxTemplateParams,
             exp_locktime: u32,
         }
 
         let cases = vec![
             TestCase {
                 name: "no fallback locktime, use plan locktime",
-                params: TemplateParams::default(),
+                params: TxTemplateParams::default(),
                 exp_locktime: 100_000,
             },
             TestCase {
                 name: "larger fallback locktime is used",
-                params: TemplateParams {
+                params: TxTemplateParams {
                     min_locktime: absolute::LockTime::from_consensus(100_100),
                     ..Default::default()
                 },
@@ -142,7 +142,7 @@ mod tests {
             },
             TestCase {
                 name: "smaller fallback locktime is ignored",
-                params: TemplateParams {
+                params: TxTemplateParams {
                     min_locktime: absolute::LockTime::from_consensus(99_900),
                     ..Default::default()
                 },
@@ -209,7 +209,7 @@ mod tests {
             )],
         };
         let (psbt, _) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
         assert_eq!(
             psbt.unsigned_tx.lock_time, time_locktime,
@@ -227,7 +227,7 @@ mod tests {
             )],
         };
         let (psbt, _) = selection
-            .into_template(TemplateParams {
+            .into_template(TxTemplateParams {
                 min_locktime: larger_time,
                 ..Default::default()
             })
@@ -280,7 +280,7 @@ mod tests {
         };
 
         let (psbt, _) = selection
-            .into_template(TemplateParams {
+            .into_template(TxTemplateParams {
                 min_locktime: LockTime::from_consensus(current_height),
                 ..Default::default()
             })

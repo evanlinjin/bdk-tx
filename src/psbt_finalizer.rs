@@ -26,7 +26,7 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 ///
 /// ```ignore
 /// let (mut psbt, finalizer) = selection
-///     .into_template(TemplateParams::default())
+///     .into_template(TxTemplateParams::default())
 ///     .create_psbt(PsbtBuildParams::default())?;
 ///
 /// // Sign the PSBT using your preferred method.
@@ -154,7 +154,7 @@ impl FinalizeMap {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use crate::{Output, PsbtBuildParams, Selection, Signer, TemplateParams};
+    use crate::{Output, PsbtBuildParams, Selection, Signer, TxTemplateParams};
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn, TxOut};
     use miniscript::bitcoin;
@@ -212,7 +212,7 @@ mod tests {
         };
 
         let (mut psbt, finalizer) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
@@ -236,7 +236,7 @@ mod tests {
         };
 
         let (mut psbt, finalizer) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
@@ -266,7 +266,7 @@ mod tests {
         };
 
         let (mut psbt, finalizer) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
 
         assert!(!psbt.outputs[0].tap_key_origins.is_empty());
@@ -318,7 +318,7 @@ mod tests {
             ],
         };
 
-        let template = selection.into_template(TemplateParams::default());
+        let template = selection.into_template(TxTemplateParams::default());
 
         let (mut psbt, mut finalizer) = template.create_psbt(PsbtBuildParams::default())?;
         // Simulate a missing plan by removing one entry (mimicking an
@@ -364,7 +364,7 @@ mod tests {
         };
 
         let (mut psbt, finalizer) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
@@ -396,7 +396,7 @@ mod tests {
         };
 
         let (mut psbt, finalizer) = selection
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();

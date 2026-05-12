@@ -199,7 +199,7 @@ fn random_range(rng: &mut impl RngCore, n: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConfirmationStatus, Input, Output, Selection, TemplateParams};
+    use crate::{ConfirmationStatus, Input, Output, Selection, TxTemplateParams};
     use bitcoin::{
         absolute::{Height, Time},
         secp256k1::Secp256k1,
@@ -249,7 +249,7 @@ mod tests {
                 Amount::from_sat(9_000),
             )],
         }
-        .into_template(TemplateParams::default())
+        .into_template(TxTemplateParams::default())
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
                 inputs: vec![input1.clone(), input2.clone(), input3.clone()],
                 outputs: vec![output.clone()],
             }
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .apply_anti_fee_sniping(tip_height, &mut OsRng)
             .unwrap();
 
@@ -343,7 +343,7 @@ mod tests {
             inputs: vec![input],
             outputs: vec![],
         }
-        .into_template(TemplateParams {
+        .into_template(TxTemplateParams {
             min_locktime: LockTime::Blocks(existing),
             ..Default::default()
         });
@@ -368,7 +368,7 @@ mod tests {
                 inputs: vec![input.clone()],
                 outputs: vec![],
             }
-            .into_template(TemplateParams {
+            .into_template(TxTemplateParams {
                 min_locktime: LockTime::from_height(existing).unwrap(),
                 ..Default::default()
             })
@@ -396,7 +396,7 @@ mod tests {
                 inputs: vec![input.clone()],
                 outputs: vec![],
             }
-            .into_template(TemplateParams {
+            .into_template(TxTemplateParams {
                 min_locktime: time_locktime,
                 ..Default::default()
             })
@@ -444,7 +444,7 @@ mod tests {
             inputs: vec![input],
             outputs: vec![],
         }
-        .into_template(TemplateParams {
+        .into_template(TxTemplateParams {
             min_locktime: time_locktime,
             ..Default::default()
         });
@@ -474,7 +474,7 @@ mod tests {
                     Amount::from_sat(9_000),
                 )],
             }
-            .into_template(TemplateParams {
+            .into_template(TxTemplateParams {
                 min_version: Version::ONE,
                 ..Default::default()
             })
@@ -540,7 +540,7 @@ mod tests {
                     Amount::from_sat(9_000),
                 )],
             }
-            .into_template(TemplateParams::default())
+            .into_template(TxTemplateParams::default())
             .apply_anti_fee_sniping(tip_height, &mut OsRng)
             .unwrap();
             assert!(
