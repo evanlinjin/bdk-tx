@@ -11,10 +11,10 @@ extern crate std;
 
 mod anti_fee_sniping;
 mod canonical_unspents;
-mod finalizer;
 mod input;
 mod input_candidates;
 mod output;
+mod psbt_finalizer;
 mod rbf;
 mod selection;
 mod selector;
@@ -23,13 +23,13 @@ mod template;
 
 pub use anti_fee_sniping::AntiFeeSnipingError;
 pub use canonical_unspents::*;
-pub use finalizer::*;
 pub use input::*;
 pub use input_candidates::*;
 pub use miniscript;
 pub use miniscript::bitcoin;
 use miniscript::{DefiniteDescriptorKey, Descriptor};
 pub use output::*;
+pub use psbt_finalizer::*;
 pub use rbf::*;
 pub use selection::*;
 pub use selector::*;

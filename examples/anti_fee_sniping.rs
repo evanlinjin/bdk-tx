@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
             )?;
 
         let selection_inputs = selection.inputs().to_vec();
-        let psbt = selection
+        let (psbt, _) = selection
             .into_template(TemplateParams::default())
             .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
             .create_psbt(PsbtBuildParams::default())?;

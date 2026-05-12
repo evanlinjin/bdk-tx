@@ -7,7 +7,7 @@ use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{Finalizer, Input, Output, Selection, SetSequenceError};
+use crate::{Input, Output, PsbtFinalizer, Selection, SetSequenceError};
 
 /// Default sequence used for plan-based inputs that don't specify their own.
 ///
@@ -277,13 +277,26 @@ impl TxTemplate {
         self.build_unsigned_tx()
     }
 
-    /// Build a [`Psbt`] from this template (non-consuming).
+    /// Build a [`Psbt`] and its accompanying [`PsbtFinalizer`] from this
+    /// template, consuming `self`.
     ///
-    /// Doesn't consume `self`, so the template remains available for
-    /// further use (e.g. [`TxTemplate::populate_finalizer`]).
-    pub fn create_psbt(&self, params: PsbtBuildParams) -> Result<Psbt, CreatePsbtError> {
+    /// The returned finalizer is populated with `(outpoint, plan)` pairs
+    /// for every plan-backed input in the template, ready to finalize the
+    /// returned PSBT after signing. PsbtInput-variant inputs (which carry
+    /// their own satisfaction data) contribute nothing.
+    ///
+    /// Callers who only need the PSBT can discard the finalizer:
+    ///
+    /// ```ignore
+    /// let (psbt, _) = template.create_psbt(PsbtBuildParams::default())?;
+    /// ```
+    pub fn create_psbt(
+        self,
+        params: PsbtBuildParams,
+    ) -> Result<(Psbt, PsbtFinalizer), CreatePsbtError> {
         let tx = self.build_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
+        let mut plans = crate::collections::HashMap::new();
 
         for (plan_input, psbt_input) in self.inputs.iter().zip(psbt.inputs.iter_mut()) {
             if let Some(finalized_psbt_input) = plan_input.psbt_input() {
@@ -314,6 +327,7 @@ impl TxTemplate {
                 }
 
                 psbt_input.sighash_type = plan_input.sighash_type();
+                plans.insert(plan_input.prev_outpoint(), plan.clone());
                 continue;
             }
             unreachable!("input candidate must either have finalized psbt input or plan");
@@ -326,23 +340,7 @@ impl TxTemplate {
             }
         }
 
-        Ok(psbt)
-    }
-
-    /// Populate a [`Finalizer`] with `(outpoint, plan)` pairs from this
-    /// template's inputs, then return `self` so it can be chained into
-    /// further construction (e.g. [`TxTemplate::create_psbt`]).
-    ///
-    /// Inputs without a `Plan` (i.e. `PsbtInput`-variant inputs) contribute
-    /// nothing — they don't need a finalizer entry because their PSBT input
-    /// already carries the satisfaction data.
-    pub fn populate_finalizer(self, finalizer: &mut Finalizer) -> Self {
-        for input in &self.inputs {
-            if let Some(plan) = input.plan() {
-                finalizer.insert(input.prev_outpoint(), plan.clone());
-            }
-        }
-        self
+        Ok((psbt, PsbtFinalizer { plans }))
     }
 
     /// Shuffle the inputs in place.

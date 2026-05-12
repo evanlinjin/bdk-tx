@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use miniscript::bitcoin::absolute;
 
-use crate::{Finalizer, Input, Output};
+use crate::{Input, Output};
 
 /// Final selection of inputs and outputs.
 ///
@@ -83,22 +83,6 @@ impl Selection {
             Some(lock_time) => lock_time,
         }
     }
-
-    /// Populate a [`Finalizer`] with `(outpoint, plan)` pairs from this
-    /// selection's inputs, then return `self` so it can be chained into
-    /// further construction (e.g. [`Selection::into_template`]).
-    ///
-    /// Inputs without a `Plan` (i.e. `PsbtInput`-variant inputs) contribute
-    /// nothing — they don't need a finalizer entry because their PSBT input
-    /// already carries the satisfaction data.
-    pub fn populate_finalizer(self, finalizer: &mut Finalizer) -> Self {
-        for input in &self.inputs {
-            if let Some(plan) = input.plan() {
-                finalizer.insert(input.prev_outpoint(), plan.clone());
-            }
-        }
-        self
-    }
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -174,7 +158,7 @@ mod tests {
                     Amount::from_sat(1000),
                 )],
             };
-            let psbt = selection
+            let (psbt, _) = selection
                 .into_template(test.params)
                 .create_psbt(PsbtBuildParams::default())?;
             assert_eq!(
@@ -224,7 +208,7 @@ mod tests {
                 Amount::from_sat(1000),
             )],
         };
-        let psbt = selection
+        let (psbt, _) = selection
             .into_template(TemplateParams::default())
             .create_psbt(PsbtBuildParams::default())?;
         assert_eq!(
@@ -242,7 +226,7 @@ mod tests {
                 Amount::from_sat(1000),
             )],
         };
-        let psbt = selection
+        let (psbt, _) = selection
             .into_template(TemplateParams {
                 min_locktime: larger_time,
                 ..Default::default()
@@ -295,7 +279,7 @@ mod tests {
             outputs: vec![output],
         };
 
-        let psbt = selection
+        let (psbt, _) = selection
             .into_template(TemplateParams {
                 min_locktime: LockTime::from_consensus(current_height),
                 ..Default::default()
