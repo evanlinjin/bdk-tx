@@ -7,64 +7,53 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 ///
 /// Finalizing a PSBT involves locating signatures and filling in the `final_script_sig`
 /// and/or `final_script_witness` fields of the PSBT input, as specified in [BIP174]. The
-/// [`Finalizer`] is able to satisfy inputs for which a valid signature has been provided using
+/// [`PsbtFinalizer`] is able to satisfy inputs for which a valid signature has been provided using
 /// the pre-computed spending [`Plan`] for each input. This process converts a PSBT input from a
 /// partially signed state to a fully signed state, making it ready for extraction into a valid
 /// Bitcoin [`Transaction`].
 ///
 /// # Usage
 ///
-/// Construct a [`Finalizer`] from a list of `(outpoint, plan)` pairs, or by calling
-/// [`into_finalizer`] on a particular [`Selection`]. Use [`finalize_input`] to finalize a single
-/// input, or [`finalize`] to finalize every input and return a map containing the result of
-/// finalization at each index. Upon finalizing the PSBT, the [`Finalizer`] also clears metadata
-/// from non-essential fields of the PSBT inputs and outputs, ensuring that only the necessary
-/// information remains for transaction extraction.
+/// `PsbtFinalizer` is constructed by [`TxTemplate::create_psbt`], which
+/// returns it paired with the [`Psbt`] it goes with. Use [`finalize_input`]
+/// to finalize a single input, or [`finalize`] to finalize every input and
+/// return a map containing the result of finalization at each index. Upon
+/// finalizing the PSBT, the [`PsbtFinalizer`] also clears metadata from
+/// non-essential fields of the PSBT inputs and outputs, ensuring that only
+/// the necessary information remains for transaction extraction.
 ///
 /// # Example
 ///
-/// ```rust,no_run
-/// # use bdk_tx::PsbtParams;
-/// # let secp = bitcoin::secp256k1::Secp256k1::new();
-/// # let keymap = std::collections::BTreeMap::new();
-/// # let selection = bdk_tx::Selection { inputs: vec![], outputs: vec![] };
-/// // Create PSBT from a selection of inputs and outputs.
-/// let mut psbt = selection.create_psbt(PsbtParams::default())?;
+/// ```ignore
+/// let (mut psbt, finalizer) = selection
+///     .into_template(TxTemplateParams::default())
+///     .create_psbt(PsbtBuildParams::default())?;
 ///
 /// // Sign the PSBT using your preferred method.
 /// let signer = bdk_tx::Signer(keymap);
 /// let _ = psbt.sign(&signer, &secp);
 ///
 /// // Finalize the PSBT.
-/// let finalizer = selection.into_finalizer();
 /// let finalize_map = finalizer.finalize(&mut psbt);
 /// assert!(finalize_map.is_finalized());
 ///
 /// // Extract the final transaction.
 /// let tx = psbt.extract_tx()?;
-/// # Ok::<_, anyhow::Error>(())
 /// ```
 ///
 /// [BIP174]: <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer>
 /// [`Selection`]: crate::Selection
-/// [`into_finalizer`]: crate::Selection::into_finalizer
+/// [`TxTemplate`]: crate::TxTemplate
 /// [`Plan`]: miniscript::plan::Plan
 /// [`Transaction`]: bitcoin::Transaction
-/// [`finalize_input`]: Finalizer::finalize_input
-/// [`finalize`]: Finalizer::finalize
+/// [`finalize_input`]: PsbtFinalizer::finalize_input
+/// [`finalize`]: PsbtFinalizer::finalize
 #[derive(Debug)]
-pub struct Finalizer {
+pub struct PsbtFinalizer {
     pub(crate) plans: HashMap<OutPoint, Plan>,
 }
 
-impl Finalizer {
-    /// Create.
-    pub fn new(plans: impl IntoIterator<Item = (OutPoint, Plan)>) -> Self {
-        Self {
-            plans: plans.into_iter().collect(),
-        }
-    }
-
+impl PsbtFinalizer {
     /// Finalize a PSBT input and return whether finalization was successful or input was already
     /// finalized.
     ///
@@ -165,7 +154,7 @@ impl FinalizeMap {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use crate::{Finalizer, Output, PsbtParams, Selection, Signer};
+    use crate::{Output, PsbtBuildParams, Selection, Signer, TxTemplateParams};
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn, TxOut};
     use miniscript::bitcoin;
@@ -222,8 +211,9 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = selection
+            .into_template(TxTemplateParams::default())
+            .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
@@ -245,8 +235,9 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = selection
+            .into_template(TxTemplateParams::default())
+            .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);
@@ -274,8 +265,9 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = selection
+            .into_template(TxTemplateParams::default())
+            .create_psbt(PsbtBuildParams::default())?;
 
         assert!(!psbt.outputs[0].tap_key_origins.is_empty());
         assert!(psbt.outputs[0].tap_internal_key.is_some());
@@ -316,10 +308,7 @@ mod tests {
         let (input_1, keymap_1) = create_input_from_descriptor_at(TR_XPRV, 1)?;
         let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
         let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
-        let finalizer = Finalizer::new([(
-            input_0.prev_outpoint(),
-            input_0.plan().cloned().expect("plan must exist"),
-        )]);
+        let input_1_outpoint = input_1.prev_outpoint();
 
         let selection = Selection {
             inputs: vec![input_0, input_1],
@@ -329,7 +318,12 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let template = selection.into_template(TxTemplateParams::default());
+
+        let (mut psbt, mut finalizer) = template.create_psbt(PsbtBuildParams::default())?;
+        // Simulate a missing plan by removing one entry (mimicking an
+        // externally-managed finalizer that doesn't have every plan).
+        finalizer.plans.remove(&input_1_outpoint);
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
         let tap_internal_key = psbt.outputs[0].tap_internal_key;
@@ -369,8 +363,9 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = selection
+            .into_template(TxTemplateParams::default())
+            .create_psbt(PsbtBuildParams::default())?;
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
         let tap_internal_key = psbt.outputs[0].tap_internal_key;
@@ -400,8 +395,9 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = selection
+            .into_template(TxTemplateParams::default())
+            .create_psbt(PsbtBuildParams::default())?;
 
         let secp = Secp256k1::new();
         let signer = Signer(keymap);

@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
-    SelectorParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
+    SelectorParams, TxTemplateParams,
 };
-use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
+use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
 
 mod common;
@@ -88,16 +88,11 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let fallback_locktime: LockTime = LockTime::from_consensus(tip_height.to_consensus_u32());
-
-        let selection_inputs = selection.inputs.clone();
-
-        let psbt = selection.create_psbt(PsbtParams {
-            enable_anti_fee_sniping: true,
-            fallback_locktime,
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            ..Default::default()
-        })?;
+        let selection_inputs = selection.inputs().to_vec();
+        let (psbt, _) = selection
+            .into_template(TxTemplateParams::default())
+            .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
+            .create_psbt(PsbtBuildParams::default())?;
 
         let tx = psbt.unsigned_tx;
 
