@@ -19,6 +19,7 @@ use payjoin::{
     send::v2::SenderBuilder,
     ImplementationError, OhttpKeys, PjUri, Request, Uri, UriExt,
 };
+use bdk_payjoin::input_pairs_from;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 use url::Url;
@@ -430,19 +431,7 @@ fn select_inputs(
         .all_candidates()
         .filter(|input| input.is_spendable(tip_height, Some(tip_time)));
 
-    let inputs = candidates
-        .inputs()
-        .filter_map(|input| {
-            // payjoin's `InputPair::new` cannot infer the input weight for unsigned P2TR
-            // or P2WSH inputs (no witness yet) and rejects `Some(weight)` for input types
-            // it *can* infer. Pass the explicit weight only when needed.
-            let spk = &input.prev_txout().script_pubkey;
-            let needs_explicit_weight = spk.is_p2tr() || spk.is_p2wsh();
-            let expected_weight = needs_explicit_weight.then(|| input.expected_input_weight());
-            let (txin, psbt_input) = input.to_psbt_pair(Sequence::ENABLE_RBF_NO_LOCKTIME);
-            InputPair::new(txin, psbt_input, expected_weight).ok()
-        })
-        .collect::<Vec<_>>();
+    let inputs = input_pairs_from(&candidates, Sequence::ENABLE_RBF_NO_LOCKTIME);
 
     if inputs.is_empty() {
         return Err(anyhow!("No suitable inputs available"));
