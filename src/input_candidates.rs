@@ -275,7 +275,7 @@ pub fn filter_unspendable(
     tip_height: absolute::Height,
     tip_mtp: Option<absolute::Time>,
 ) -> impl Fn(&Input) -> bool {
-    move |input| input.is_spendable(tip_height, tip_mtp).unwrap_or(false)
+    move |input| input.is_spendable(tip_height, tip_mtp)
 }
 
 /// No filtering.

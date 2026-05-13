@@ -5,8 +5,8 @@ use bdk_tx::{
     Signer,
 };
 use bitcoin::{
-    consensus::encode::serialize_hex, key::Secp256k1, psbt, secp256k1::All, Amount, FeeRate, Psbt,
-    Sequence, Transaction, TxIn, Txid, Weight,
+    consensus::encode::serialize_hex, key::Secp256k1, secp256k1::All, Amount, FeeRate, Psbt,
+    Sequence, Transaction, Txid,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 use payjoin::{
@@ -240,38 +240,33 @@ fn extract_pj_tx(
     secp: &Secp256k1<All>,
 ) -> anyhow::Result<Transaction> {
     let assets = wallet.assets();
-    let mut plans = Vec::new();
+    let finalizer = Finalizer::from_psbt(&psbt, |op| wallet.plan_of_output(op, &assets));
+    finalizer.update_psbt(&mut psbt);
 
-    for (index, input) in psbt.unsigned_tx.input.iter().enumerate() {
-        let outpoint = input.previous_output;
-
-        if let Some(plan) = wallet.plan_of_output(outpoint, &assets) {
-            let psbt_input = &mut psbt.inputs[index];
-
-            // Only update if not already finalized
-            if psbt_input.final_script_sig.is_none() && psbt_input.final_script_witness.is_none() {
-                plan.update_psbt_input(psbt_input);
-
-                if let Some(prev_tx) = wallet.graph.graph().get_tx(outpoint.txid) {
-                    psbt_input.non_witness_utxo = Some(prev_tx.as_ref().clone());
-                    if let Some(txout) = prev_tx.output.get(outpoint.vout as usize) {
-                        psbt_input.witness_utxo = Some(txout.clone());
-                    }
-                }
+    // The receiver's proposal may have stripped non-essential fields. Re-attach
+    // witness_utxo / non_witness_utxo from the wallet's graph for our inputs.
+    for input_index in 0..psbt.inputs.len() {
+        let outpoint = psbt.unsigned_tx.input[input_index].previous_output;
+        if wallet.plan_of_output(outpoint, &assets).is_none() {
+            continue;
+        }
+        let psbt_input = &mut psbt.inputs[input_index];
+        if psbt_input.final_script_witness.is_some() || psbt_input.final_script_sig.is_some() {
+            continue;
+        }
+        if let Some(prev_tx) = wallet.graph.graph().get_tx(outpoint.txid) {
+            psbt_input.non_witness_utxo = Some(prev_tx.as_ref().clone());
+            if let Some(txout) = prev_tx.output.get(outpoint.vout as usize) {
+                psbt_input.witness_utxo = Some(txout.clone());
             }
-
-            plans.push((outpoint, plan));
         }
     }
 
-    let finalizer = Finalizer::new(plans);
     let _ = psbt.sign(signer, secp);
     let finalize_map = finalizer.finalize(&mut psbt);
-
     if !finalize_map.is_finalized() {
         return Err(anyhow!("Failed to finalize PSBT: {finalize_map:?}"));
     }
-
     Ok(psbt.extract_tx()?)
 }
 
@@ -417,19 +412,10 @@ fn finalize_psbt(
     secp: &Secp256k1<All>,
 ) -> anyhow::Result<()> {
     let assets = wallet.assets();
-    let mut plans = Vec::new();
-
-    for input in psbt.unsigned_tx.input.iter() {
-        let outpoint = input.previous_output;
-        if let Some(plan) = wallet.plan_of_output(outpoint, &assets) {
-            plans.push((outpoint, plan));
-        }
-    }
-
-    let finalizer = Finalizer::new(plans);
+    let finalizer = Finalizer::from_psbt(psbt, |op| wallet.plan_of_output(op, &assets));
+    finalizer.update_psbt(psbt);
     let _ = psbt.sign(signer, secp);
     finalizer.finalize(psbt);
-
     Ok(())
 }
 
@@ -439,43 +425,21 @@ fn select_inputs(
     env: &TestEnv,
 ) -> anyhow::Result<Vec<InputPair>> {
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
-    let assets = wallet.assets();
 
     let candidates = wallet
         .all_candidates()
-        .filter(|input| input.is_spendable(tip_height, Some(tip_time)).unwrap_or(false));
+        .filter(|input| input.is_spendable(tip_height, Some(tip_time)));
 
     let inputs = candidates
         .inputs()
         .filter_map(|input| {
-            let outpoint = input.prev_outpoint();
-            let plan = wallet.plan_of_output(outpoint, &assets)?;
-            let txout = input.prev_txout().clone();
-
-            let txin = TxIn {
-                previous_output: outpoint,
-                sequence: input.sequence().unwrap_or(Sequence::ENABLE_RBF_NO_LOCKTIME),
-                ..Default::default()
-            };
-
-            let mut psbt_input = psbt::Input {
-                witness_utxo: Some(txout.clone()),
-                non_witness_utxo: input.prev_tx().cloned(),
-                ..Default::default()
-            };
-            plan.update_psbt_input(&mut psbt_input);
-
-            // payjoin's `InputPair::new` cannot infer the input weight for unsigned P2TR or
-            // P2WSH inputs (no witness yet), so we provide it explicitly. For input types it
-            // *can* infer (P2WPKH, P2PKH, etc.) we pass `None` — passing `Some` for those
-            // would be rejected as `ProvidedUnnecessaryWeight`.
-            let needs_explicit_weight =
-                txout.script_pubkey.is_p2tr() || txout.script_pubkey.is_p2wsh();
-            let expected_weight = needs_explicit_weight.then(|| {
-                // Total input weight = base txin (41 bytes × 4 wu) + witness satisfaction.
-                Weight::from_wu(input.satisfaction_weight() + 41 * 4)
-            });
-
+            // payjoin's `InputPair::new` cannot infer the input weight for unsigned P2TR
+            // or P2WSH inputs (no witness yet) and rejects `Some(weight)` for input types
+            // it *can* infer. Pass the explicit weight only when needed.
+            let spk = &input.prev_txout().script_pubkey;
+            let needs_explicit_weight = spk.is_p2tr() || spk.is_p2wsh();
+            let expected_weight = needs_explicit_weight.then(|| input.expected_input_weight());
+            let (txin, psbt_input) = input.to_psbt_pair(Sequence::ENABLE_RBF_NO_LOCKTIME);
             InputPair::new(txin, psbt_input, expected_weight).ok()
         })
         .collect::<Vec<_>>();
