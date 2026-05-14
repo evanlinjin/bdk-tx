@@ -1,35 +1,44 @@
 //! `bdk_tx` ergonomics for the [`payjoin_runtime`] sans-IO state machines.
 //!
 //! This crate re-exports the runtime and adds a small set of helpers that
-//! convert `bdk_tx`-flavored values into the shapes the runtime traits expect:
+//! convert `bdk_tx`-flavored values into the shapes the runtime expects:
 //!
 //! - [`input_pair_from`] / [`input_pairs_from`]: turn `bdk_tx::Input`s into
-//!   payjoin [`InputPair`]s, handling the P2TR / P2WSH weight quirk.
-//! - [`sign_and_finalize_with_plans`]: implement a wallet's `process_psbt`
-//!   method using `bdk_tx::Finalizer` and a `plan_of_output` lookup.
+//!   payjoin [`InputPair`]s, handling the P2TR / P2WSH weight quirk. Use this
+//!   to build the response to a [`ReceiverStep::Contribute`].
+//! - [`sign_and_finalize_with_plans`]: sign and finalize a PSBT using
+//!   `bdk_tx::Finalizer` + a `plan_of_output` lookup. Use this to build the
+//!   PSBT you hand to
+//!   [`ReceiverSession::feed_signed_psbt`](payjoin_runtime::ReceiverSession::feed_signed_psbt)
+//!   /
+//!   [`SenderSession::feed_signed_psbt`](payjoin_runtime::SenderSession::feed_signed_psbt).
 //!
 //! The runtime itself depends only on `payjoin`, `bitcoin`, and `bitcoin-ohttp`;
 //! the `bdk_tx` integration is opt-in via this crate.
 //!
 //! ```ignore
 //! use bdk_payjoin::{
-//!     input_pairs_from, sign_and_finalize_with_plans, ReceiverSession, ReceiverWallet,
+//!     input_pairs_from, sign_and_finalize_with_plans, ReceiverSession, ReceiverStep,
 //! };
-//! # struct MyWallet;
-//! impl ReceiverWallet for MyWallet {
-//!     // ... is_owned, check_broadcast ...
 //!
-//!     fn contribute(&self) -> Result<Vec<bdk_payjoin::InputPair>, bdk_payjoin::Error> {
-//!         let candidates = todo!("build bdk_tx::InputCandidates");
-//!         Ok(input_pairs_from(&candidates, bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME))
-//!     }
-//!
-//!     fn process_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<(), bdk_payjoin::Error> {
-//!         sign_and_finalize_with_plans(
-//!             psbt,
-//!             |op| todo!("look up plan for op"),
-//!             |psbt| todo!("sign psbt with your signer"),
-//!         )
+//! let mut session = ReceiverSession::new(builder, relay, fee_range)?;
+//! loop {
+//!     match session.poll() {
+//!         ReceiverStep::Contribute => {
+//!             let candidates = todo!("build bdk_tx::InputCandidates");
+//!             let inputs = input_pairs_from(&candidates, bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME);
+//!             session.feed_contribute(inputs)?;
+//!         }
+//!         ReceiverStep::SignAndFinalize(mut psbt) => {
+//!             sign_and_finalize_with_plans(
+//!                 &mut psbt,
+//!                 |op| todo!("look up plan for op"),
+//!                 |psbt| todo!("sign psbt with your signer"),
+//!             )?;
+//!             session.feed_signed_psbt(psbt)?;
+//!         }
+//!         // ... other ReceiverStep variants ...
+//!         _ => todo!(),
 //!     }
 //! }
 //! ```
@@ -85,26 +94,25 @@ pub fn input_pairs_from(
         .collect()
 }
 
-/// Implement a wallet's `process_psbt` method using `bdk_tx::Finalizer` and a
+/// Sign and finalize a payjoin PSBT using `bdk_tx::Finalizer` and a
 /// per-outpoint plan lookup.
 ///
-/// This is the typical adapter for both [`ReceiverWallet::process_psbt`] and
-/// [`SenderWallet::process_psbt`]:
-/// 1. Build a [`Finalizer`] for outpoints we own.
-/// 2. Re-attach plan-derived fields (bip32 / taproot origins) to those PSBT
-///    inputs.
-/// 3. Call `sign` to add signatures.
-/// 4. Finalize the inputs we own.
+/// Use this to build the PSBT you hand to
+/// [`ReceiverSession::feed_signed_psbt`] /
+/// [`SenderSession::feed_signed_psbt`]. The function:
 ///
-/// The `sign` closure is just `psbt.sign(&signer, &secp)` in most callers; we
+/// 1. Builds a [`Finalizer`] for outpoints we own (those `plan_for` returns
+///    `Some` for).
+/// 2. Re-attaches plan-derived fields (bip32 / taproot origins) to those PSBT
+///    inputs.
+/// 3. Calls `sign` to add signatures.
+/// 4. Finalizes the inputs we own.
+///
+/// The `sign` closure is typically `psbt.sign(&signer, &secp)` in callers; we
 /// don't take it directly so callers can pass their preferred error mapping.
 ///
-/// For the **sender** call site, you'll typically pair this with
-/// [`payjoin_runtime::restore_psbt_utxos`] before signing — the proposal often
-/// strips `witness_utxo` / `non_witness_utxo` that the signer needs.
-///
-/// [`ReceiverWallet::process_psbt`]: payjoin_runtime::ReceiverWallet::process_psbt
-/// [`SenderWallet::process_psbt`]: payjoin_runtime::SenderWallet::process_psbt
+/// [`ReceiverSession::feed_signed_psbt`]: payjoin_runtime::ReceiverSession::feed_signed_psbt
+/// [`SenderSession::feed_signed_psbt`]: payjoin_runtime::SenderSession::feed_signed_psbt
 pub fn sign_and_finalize_with_plans(
     psbt: &mut Psbt,
     plan_for: impl Fn(OutPoint) -> Option<Plan>,

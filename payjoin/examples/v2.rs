@@ -1,23 +1,21 @@
-//! Payjoin v2 example using `bdk_payjoin`'s high-level runtime.
+//! Payjoin v2 example using `bdk_payjoin`'s sans-IO runtime.
 //!
 //! Two tokio tasks drive the receiver and sender independently. Each holds a
-//! [`ReceiverSession`] / [`SenderSession`] and a tiny adapter struct that
-//! implements [`ReceiverWallet`] / [`SenderWallet`] over the example's `Wallet`
-//! type. A single `drive_session` helper turns the sans-IO step API into
-//! reqwest HTTP calls.
+//! [`ReceiverSession`] / [`SenderSession`] and dispatches each [`ReceiverStep`]
+//! / [`SenderStep`] variant against the example's `Wallet` / `Signer` directly
+//! — no wallet trait is involved.
 
 use anyhow::{anyhow, Result};
 use bdk_payjoin::{
-    input_pairs_from, restore_psbt_utxos, sign_and_finalize_with_plans, FeeRange,
-    ImplementationError, InputPair, OhttpKeys, ReceiverBuilder, ReceiverSession, ReceiverWallet,
-    SenderSession, SenderWallet, Step, Uri, UriExt,
+    input_pairs_from, sign_and_finalize_with_plans, FeeRange, OhttpKeys, ReceiverBuilder,
+    ReceiverSession, ReceiverStep, SenderSession, SenderStep, Uri, UriExt,
 };
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable, group_by_spk, ChangeScript, Output, PsbtParams, SelectorParams, Signer,
 };
 use bitcoin::{
-    consensus::encode::serialize_hex, key::Secp256k1, secp256k1::All, Amount, FeeRate, Psbt, Script,
+    consensus::encode::serialize_hex, key::Secp256k1, secp256k1::All, Amount, FeeRate, Psbt,
     Sequence, Transaction, Txid,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
@@ -110,83 +108,81 @@ async fn run_receiver(
     ohttp_keys: OhttpKeys,
     uri_tx: oneshot::Sender<String>,
 ) -> Result<Wallet> {
+    let secp = Secp256k1::new();
+
     let receiver_address = wallet.next_address().ok_or_else(|| anyhow!("no address"))?;
     let builder = ReceiverBuilder::new(receiver_address, payjoin_directory.as_str(), ohttp_keys)?;
 
-    let adapter = RecvAdapter {
-        wallet,
-        env,
-        signer,
-        secp: Secp256k1::new(),
-    };
     let fee_range = FeeRange {
         min: Some(FeeRate::BROADCAST_MIN),
         max: Some(FeeRate::from_sat_per_vb(2).expect("valid fee rate")),
     };
-    let mut session = ReceiverSession::new(builder, ohttp_relay.as_str(), adapter, fee_range)?;
+    let mut session = ReceiverSession::new(builder, ohttp_relay.as_str(), fee_range)?;
 
     uri_tx
         .send(session.pj_uri().to_string())
         .map_err(|_| anyhow!("sender dropped before receiving pj_uri"))?;
 
     let http = reqwest::Client::new();
-    drive_receiver(&mut session, &http).await?;
-
-    Ok(session.into_wallet().wallet)
+    drive_receiver(&mut session, &http, &env, &mut wallet, &signer, &secp).await?;
+    Ok(wallet)
 }
 
-struct RecvAdapter {
-    wallet: Wallet,
-    env: Arc<TestEnv>,
-    signer: Signer,
-    secp: Secp256k1<All>,
-}
-
-impl ReceiverWallet for RecvAdapter {
-    fn is_owned(&self, spk: &Script) -> bool {
-        self.wallet
-            .graph
-            .index
-            .index_of_spk(spk.to_owned())
-            .is_some()
-    }
-
-    fn check_broadcast(&self, tx: &Transaction) -> Result<bool, ImplementationError> {
-        let res = self
-            .env
-            .rpc_client()
-            .test_mempool_accept(&[serialize_hex(tx)])
-            .map_err(ImplementationError::new)?;
-        Ok(res
-            .first()
-            .ok_or_else(|| ImplementationError::from("empty testmempoolaccept response"))?
-            .allowed)
-    }
-
-    fn contribute(&self) -> Result<Vec<InputPair>, bdk_payjoin::Error> {
-        let (tip_height, tip_time) = self
-            .wallet
-            .tip_info(self.env.rpc_client())
-            .map_err(|e| bdk_payjoin::Error::Wallet(e.to_string()))?;
-        let candidates = self
-            .wallet
-            .all_candidates()
-            .filter(|input| input.is_spendable(tip_height, Some(tip_time)));
-        Ok(input_pairs_from(&candidates, Sequence::ENABLE_RBF_NO_LOCKTIME))
-    }
-
-    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), bdk_payjoin::Error> {
-        let assets = self.wallet.assets();
-        sign_and_finalize_with_plans(
-            psbt,
-            |op| self.wallet.plan_of_output(op, &assets),
-            |psbt| {
-                psbt.sign(&self.signer, &self.secp).map_err(|(_, errs)| {
-                    bdk_payjoin::Error::Wallet(format!("sign: {errs:?}"))
-                })?;
-                Ok(())
-            },
-        )
+async fn drive_receiver(
+    session: &mut ReceiverSession,
+    http: &reqwest::Client,
+    env: &TestEnv,
+    wallet: &mut Wallet,
+    signer: &Signer,
+    secp: &Secp256k1<All>,
+) -> Result<()> {
+    loop {
+        match session.poll() {
+            ReceiverStep::Save(events) => {
+                // Production callers persist atomically. The example logs.
+                println!("[recv] would persist {} event(s)", events.len());
+            }
+            ReceiverStep::SendRequest(req) => {
+                let bytes = send(http, req).await?;
+                session.feed_response(bytes)?;
+            }
+            ReceiverStep::Backoff => tokio::time::sleep(POLL_INTERVAL).await,
+            ReceiverStep::CheckBroadcast(tx) => {
+                let ok = test_mempool_accept(env, &tx)?;
+                session.feed_broadcast_check(ok)?;
+            }
+            ReceiverStep::ResolveOwned(spks) => {
+                let answers = spks
+                    .iter()
+                    .map(|spk| wallet.graph.index.index_of_spk(spk.clone()).is_some())
+                    .collect::<Vec<_>>();
+                session.feed_owned(answers)?;
+            }
+            ReceiverStep::Contribute => {
+                let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
+                let candidates = wallet
+                    .all_candidates()
+                    .filter(|input| input.is_spendable(tip_height, Some(tip_time)));
+                let inputs = input_pairs_from(&candidates, Sequence::ENABLE_RBF_NO_LOCKTIME);
+                session.feed_contribute(inputs)?;
+            }
+            ReceiverStep::SignAndFinalize(mut psbt) => {
+                let assets = wallet.assets();
+                sign_and_finalize_with_plans(
+                    &mut psbt,
+                    |op| wallet.plan_of_output(op, &assets),
+                    |psbt| {
+                        psbt.sign(signer, secp).map_err(|(_, errs)| {
+                            bdk_payjoin::Error::Wallet(format!("sign: {errs:?}"))
+                        })?;
+                        Ok(())
+                    },
+                )?;
+                session.feed_signed_psbt(psbt)?;
+            }
+            ReceiverStep::Done => return Ok(()),
+            ReceiverStep::Failed(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -196,7 +192,7 @@ impl ReceiverWallet for RecvAdapter {
 
 async fn run_sender(
     env: Arc<TestEnv>,
-    wallet: Wallet,
+    mut wallet: Wallet,
     signer: Signer,
     change_desc: Descriptor<DescriptorPublicKey>,
     ohttp_relay: Url,
@@ -212,22 +208,11 @@ async fn run_sender(
         .map_err(|e| anyhow!("{e}"))?;
 
     let psbt = build_original_psbt(&env, &wallet, &signer, &pj_uri, &change_desc, &secp)?;
-
-    let adapter = SendAdapter {
-        wallet,
-        signer,
-        secp,
-    };
-    let mut session = SenderSession::new(
-        psbt,
-        pj_uri,
-        ohttp_relay.as_str(),
-        adapter,
-        FeeRate::BROADCAST_MIN,
-    )?;
+    let mut session =
+        SenderSession::new(psbt, pj_uri, ohttp_relay.as_str(), FeeRate::BROADCAST_MIN)?;
 
     let http = reqwest::Client::new();
-    drive_sender(&mut session, &http).await?;
+    drive_sender(&mut session, &http, &mut wallet, &signer, &secp).await?;
 
     let tx = session
         .final_tx()
@@ -235,88 +220,59 @@ async fn run_sender(
         .clone();
     let fee = session.fee().expect("done implies fee");
     let txid = env.rpc_client().send_raw_transaction(&tx)?;
-    Ok((session.into_wallet().wallet, txid, fee))
+    Ok((wallet, txid, fee))
 }
 
-struct SendAdapter {
-    wallet: Wallet,
-    signer: Signer,
-    secp: Secp256k1<All>,
-}
-
-impl SenderWallet for SendAdapter {
-    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), bdk_payjoin::Error> {
-        let assets = self.wallet.assets();
-        // 1. Restore witness/non-witness UTXOs the proposal sanitized away.
-        restore_psbt_utxos(
-            psbt,
-            |op| self.wallet.plan_of_output(op, &assets).is_some(),
-            |txid| {
-                self.wallet
-                    .graph
-                    .graph()
-                    .get_tx(txid)
-                    .map(|t| t.as_ref().clone())
-            },
-        );
-        // 2 + 3. Sign and finalize the sender's inputs.
-        sign_and_finalize_with_plans(
-            psbt,
-            |op| self.wallet.plan_of_output(op, &assets),
-            |psbt| {
-                psbt.sign(&self.signer, &self.secp).map_err(|(_, errs)| {
-                    bdk_payjoin::Error::Wallet(format!("sign: {errs:?}"))
-                })?;
-                Ok(())
-            },
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Drive loops — turn sans-IO Steps into reqwest calls.
-// ---------------------------------------------------------------------------
-
-async fn drive_receiver<W: ReceiverWallet>(
-    session: &mut ReceiverSession<W>,
+async fn drive_sender(
+    session: &mut SenderSession,
     http: &reqwest::Client,
+    wallet: &mut Wallet,
+    signer: &Signer,
+    secp: &Secp256k1<All>,
 ) -> Result<()> {
     loop {
         match session.poll() {
-            Step::Save(events) => {
-                // Production callers persist these atomically. The example
-                // doesn't need durability; we just log the count.
-                println!("[recv] would persist {} event(s)", events.len());
-            }
-            Step::SendRequest(req) => {
-                let bytes = send(http, req).await?;
-                session.feed_response(bytes)?;
-            }
-            Step::Backoff => tokio::time::sleep(POLL_INTERVAL).await,
-            Step::Done => return Ok(()),
-            Step::Failed(e) => return Err(e.into()),
-        }
-    }
-}
-
-async fn drive_sender<W: SenderWallet>(
-    session: &mut SenderSession<W>,
-    http: &reqwest::Client,
-) -> Result<()> {
-    loop {
-        match session.poll() {
-            Step::Save(events) => {
+            SenderStep::Save(events) => {
                 println!("[send] would persist {} event(s)", events.len());
             }
-            Step::SendRequest(req) => {
+            SenderStep::SendRequest(req) => {
                 let bytes = send(http, req).await?;
                 session.feed_response(bytes)?;
             }
-            Step::Backoff => tokio::time::sleep(POLL_INTERVAL).await,
-            Step::Done => return Ok(()),
-            Step::Failed(e) => return Err(e.into()),
+            SenderStep::Backoff => tokio::time::sleep(POLL_INTERVAL).await,
+            SenderStep::SignAndFinalize(mut psbt) => {
+                let assets = wallet.assets();
+                // Payjoin already restored UTXOs on the sender's inputs inside
+                // process_proposal — the PSBT here is signer-ready. Just sign
+                // and finalize.
+                sign_and_finalize_with_plans(
+                    &mut psbt,
+                    |op| wallet.plan_of_output(op, &assets),
+                    |psbt| {
+                        psbt.sign(signer, secp).map_err(|(_, errs)| {
+                            bdk_payjoin::Error::Wallet(format!("sign: {errs:?}"))
+                        })?;
+                        Ok(())
+                    },
+                )?;
+                session.feed_signed_psbt(psbt)?;
+            }
+            SenderStep::Done => return Ok(()),
+            SenderStep::Failed(e) => return Err(e.into()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Side helpers
+// ---------------------------------------------------------------------------
+
+fn test_mempool_accept(env: &TestEnv, tx: &Transaction) -> Result<bool> {
+    let res = env.rpc_client().test_mempool_accept(&[serialize_hex(tx)])?;
+    Ok(res
+        .first()
+        .ok_or_else(|| anyhow!("empty testmempoolaccept response"))?
+        .allowed)
 }
 
 async fn send(http: &reqwest::Client, req: bdk_payjoin::Request) -> Result<Vec<u8>> {
@@ -333,7 +289,7 @@ async fn send(http: &reqwest::Client, req: bdk_payjoin::Request) -> Result<Vec<u
 }
 
 // ---------------------------------------------------------------------------
-// Original-PSBT construction (unchanged from before — pure bdk_tx).
+// Original-PSBT construction (pure bdk_tx).
 // ---------------------------------------------------------------------------
 
 fn build_original_psbt(
