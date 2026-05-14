@@ -1,33 +1,86 @@
-//! Glue between [`bdk_tx`] and the [`payjoin`] crate.
+//! High-level sans-IO runtime for the payjoin v2 protocol, integrated with `bdk_tx`.
 //!
-//! This crate is a thin convenience layer — it encapsulates the conventions shared
-//! by both libraries so callers don't have to discover them by hand. The functions
-//! exposed here cover the receiver's contribute-inputs step (turning bdk_tx
-//! candidate inputs into payjoin [`InputPair`]s).
+//! `bdk_payjoin` exposes a driver per role ([`ReceiverSession`], [`SenderSession`])
+//! that owns the multi-stage payjoin typestate, the OHTTP polling cycle, and the
+//! `.save(&persister)` ceremony. The caller drives each session by exchanging
+//! [`Request`] / response bytes with their preferred HTTP transport and supplies
+//! wallet-aware decisions through the [`ReceiverWallet`] / [`SenderWallet`] traits.
 //!
-//! For the sender side of the v2 flow, no glue is needed: use
-//! [`bdk_tx::Finalizer::from_psbt`] / [`bdk_tx::Finalizer::update_psbt`] to finalise
-//! the sender's inputs in the proposal PSBT.
-//!
-//! # Example (receiver)
+//! # Sketch
 //!
 //! ```ignore
-//! # use bdk_tx::InputCandidates;
-//! # use bitcoin::Sequence;
-//! # fn contribute(payjoin: &payjoin::receive::v2::Receiver<payjoin::receive::v2::WantsInputs>,
-//! #               candidates: &InputCandidates) -> anyhow::Result<()> {
-//! let inputs = bdk_payjoin::input_pairs_from(candidates, Sequence::ENABLE_RBF_NO_LOCKTIME);
-//! let selected = payjoin.try_preserving_privacy(inputs)?;
-//! // pass `selected` (or a wider Vec) to `contribute_inputs`...
-//! # Ok(())
-//! # }
+//! let mut session = ReceiverSession::new(builder, relay, wallet, fee_range)?;
+//! loop {
+//!     match session.poll() {
+//!         Step::SendRequest(req) => {
+//!             let resp = http.post(req).await?;
+//!             session.feed_response(resp.bytes().to_vec())?;
+//!         }
+//!         Step::Backoff => sleep(Duration::from_secs(2)).await,
+//!         Step::Done => break,
+//!         Step::Failed(e) => return Err(e.into()),
+//!     }
+//! }
 //! ```
+//!
+//! For users who want to drive the payjoin state machine manually, the lower-level
+//! glue ([`input_pair_from`], [`input_pairs_from`], [`restore_psbt_utxos`]) is also
+//! exposed.
 
 #![warn(missing_docs)]
 
+mod error;
+mod psbt;
+mod receiver;
+mod sender;
+
+pub use error::Error;
+pub use psbt::restore_psbt_utxos;
+pub use receiver::{ReceiverSession, ReceiverWallet};
+pub use sender::{SenderSession, SenderWallet};
+
+// Re-exports for callers so they don't need to depend on `payjoin` directly.
+pub use payjoin::receive::v2::ReceiverBuilder;
+pub use payjoin::send::v2::SenderBuilder;
+pub use payjoin::{OhttpKeys, PjUri, Request, Uri};
+
 use bdk_tx::{Input, InputCandidates};
-use bitcoin::Sequence;
+use bitcoin::{FeeRate, Sequence};
 use payjoin::receive::InputPair;
+
+/// Output of [`ReceiverSession::poll`] / [`SenderSession::poll`] — what the
+/// caller should do to drive the state machine forward.
+#[derive(Debug)]
+pub enum Step {
+    /// Send this HTTP request, then feed the response body back via
+    /// `feed_response`.
+    SendRequest(Request),
+    /// The directory had no payload yet. Sleep, then call `poll` again. The
+    /// runtime never enforces a specific delay — pick what's appropriate for
+    /// your context (a few seconds is conventional).
+    Backoff,
+    /// The session reached its terminal success state. For the sender, the
+    /// finalized transaction is now available via
+    /// [`SenderSession::final_tx`](crate::SenderSession::final_tx).
+    Done,
+    /// The session failed terminally. Subsequent `poll` calls will return
+    /// [`Error::Terminated`].
+    Failed(Error),
+}
+
+/// Fee-range bounds passed by the receiver to payjoin's `apply_fee_range`.
+///
+/// Both endpoints are optional: `None` for `min` means "accept payjoin's
+/// recommended minimum (broadcast-min)"; `None` for `max` means "the receiver
+/// will not pay for any of the network fee".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeeRange {
+    /// Minimum effective feerate the receiver accepts on the proposal.
+    pub min: Option<FeeRate>,
+    /// Maximum effective feerate the receiver is willing to pay for their own
+    /// contributed input/output. `None` opts out of receiver-paid fees.
+    pub max: Option<FeeRate>,
+}
 
 /// Convert a single [`Input`] into a payjoin [`InputPair`].
 ///
@@ -53,9 +106,7 @@ pub fn input_pair_from(input: &Input, fallback_sequence: Sequence) -> Option<Inp
 
 /// Convert every input in `candidates` into a payjoin [`InputPair`].
 ///
-/// Inputs that payjoin rejects are silently dropped. Pass the result to
-/// `Receiver<WantsInputs>::try_preserving_privacy` or
-/// `Receiver<WantsInputs>::contribute_inputs`.
+/// Inputs that payjoin rejects are silently dropped.
 pub fn input_pairs_from(
     candidates: &InputCandidates,
     fallback_sequence: Sequence,
