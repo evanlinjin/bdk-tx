@@ -104,6 +104,11 @@ impl<W: SenderWallet> SenderSession<W> {
         self.result.as_ref().map(|(_, f)| *f)
     }
 
+    /// Consume the session and return the wallet adapter.
+    pub fn into_wallet(self) -> W {
+        self.wallet
+    }
+
     /// Advance the state machine and report what the caller should do next.
     pub fn poll(&mut self) -> Step {
         let state = match self.state.take() {

@@ -42,7 +42,7 @@ pub use sender::{SenderSession, SenderWallet};
 // Re-exports for callers so they don't need to depend on `payjoin` directly.
 pub use payjoin::receive::v2::ReceiverBuilder;
 pub use payjoin::send::v2::SenderBuilder;
-pub use payjoin::{OhttpKeys, PjUri, Request, Uri};
+pub use payjoin::{ImplementationError, OhttpKeys, PjUri, Request, Uri, UriExt};
 
 use bdk_tx::{Input, InputCandidates};
 use bitcoin::{FeeRate, Sequence};

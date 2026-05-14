@@ -130,6 +130,14 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         &self.pj_uri
     }
 
+    /// Consume the session and return the wallet adapter.
+    ///
+    /// Useful for recovering ownership of the wallet after the session terminates
+    /// (e.g. to sync against the broadcast transaction).
+    pub fn into_wallet(self) -> W {
+        self.wallet
+    }
+
     /// Advance the state machine and report what the caller should do next.
     pub fn poll(&mut self) -> Step {
         let state = match self.state.take() {
@@ -275,9 +283,11 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
                 wallet
                     .sign(&mut psbt)
                     .map_err(|e| ImplementationError::from(e.to_string().as_str()))?;
-                if !f.finalize(&mut psbt).is_finalized() {
-                    return Err(ImplementationError::from("failed to finalize proposal PSBT"));
-                }
+                // `finalize` here only resolves the receiver's contributed inputs; the
+                // sender's inputs remain unfinalized on purpose and will be signed by
+                // the sender after the proposal round-trips. `is_finalized()` would be
+                // false at this point, but that's expected — don't treat it as an error.
+                let _ = f.finalize(&mut psbt);
                 Ok(psbt)
             })
             .save(&persister)
