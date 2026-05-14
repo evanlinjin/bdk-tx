@@ -10,10 +10,10 @@ description = "bdk_tx ergonomics for the payjoin_runtime sans-IO state machines.
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Until evanlinjin's rust-payjoin fork is pushed, we point at a sibling checkout
-# of github.com/payjoin/rust-payjoin on master. Switch to a git+branch dep once
-# the fork is published.
-payjoin_runtime = { version = "0.1.0", package = "payjoin-runtime", path = "../../rust-payjoin/payjoin-runtime" }
+# Tracks evanlinjin/rust-payjoin's local/payjoin-runtime-accessors branch
+# (payjoin-runtime crate + two upstream accessor PRs + the public-deconstruct
+# PR). Will move to a crates.io release once the upstream PRs land.
+payjoin_runtime = { version = "0.1.0", package = "payjoin-runtime", git = "https://github.com/evanlinjin/rust-payjoin", branch = "local/payjoin-runtime-accessors" }
 bdk_tx = { version = "0.1.0", path = "../tx", default-features = false }
 miniscript = { version = "12.3.5", default-features = false }
 bitcoin = { version = "0.32", default-features = false }
@@ -23,9 +23,9 @@ anyhow = "1"
 bdk_testenv = "0.13.0"
 bdk_bitcoind_rpc = "0.20.0"
 bdk_chain = { version = "0.23.0" }
-# Track the same in-tree payjoin source `payjoin_runtime` is built against,
-# so the example and runtime see the same types.
-payjoin = { version = "0.25.0", path = "../../rust-payjoin/payjoin", features = ["v2", "io"], default-features = false }
+# Same git+branch as `payjoin_runtime` above so the example and runtime see
+# the same types.
+payjoin = { version = "0.25.0", git = "https://github.com/evanlinjin/rust-payjoin", branch = "local/payjoin-runtime-accessors", features = ["v2", "io"], default-features = false }
 url = { version = "2.5.7", features = ["serde"] }
 tokio = { version = "1.47.1", features = ["full"] }
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
