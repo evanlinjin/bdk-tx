@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex};
 use bitcoin::{Amount, FeeRate, Psbt, Transaction};
 use payjoin::persist::OptionalTransitionOutcome;
 use payjoin::send::v2::{
-    PollingForProposal, Sender, SenderBuilder, SessionEvent, WithReplyKey,
+    replay_event_log, PollingForProposal, SendSession, Sender, SenderBuilder, SessionEvent,
+    SessionOutcome, WithReplyKey,
 };
 use payjoin::PjUri;
 
-use crate::persister::Capturing;
+use crate::persister::{Capturing, Replay};
 use crate::{Error, Step};
 
 /// Wallet capabilities required by [`SenderSession`].
@@ -115,16 +116,46 @@ impl<W: SenderWallet> SenderSession<W> {
     /// payjoin's state machine to reconstruct the sender's current state, then
     /// continues from there.
     ///
-    /// Currently stubbed — see issue tracker.
+    /// If the saved log ends in a successful [`SessionOutcome::Success`], the
+    /// returned session is already `Done`; [`final_tx`](Self::final_tx) and
+    /// [`fee`](Self::fee) are recomputed from the saved proposal PSBT by
+    /// running `wallet.process_psbt`. The `_min_fee_rate` argument is unused
+    /// in this path (the proposal's feerate is already fixed).
     pub fn resume_from_events(
-        _events: Vec<SessionEvent>,
-        _ohttp_relay: impl Into<String>,
-        _wallet: W,
+        events: Vec<SessionEvent>,
+        ohttp_relay: impl Into<String>,
+        wallet: W,
         _min_fee_rate: FeeRate,
     ) -> Result<Self, Error> {
-        Err(Error::Payjoin(
-            "resume_from_events is not yet implemented".into(),
-        ))
+        let persister = Replay::new(events);
+        let (session, _history) =
+            replay_event_log(&persister).map_err(|e| Error::payjoin(format!("{e:?}")))?;
+
+        let mut me = Self {
+            wallet,
+            ohttp_relay: ohttp_relay.into(),
+            state: None,
+            result: None,
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let state = match session {
+            SendSession::WithReplyKey(s) => State::PostingOriginal(s),
+            SendSession::PollingForProposal(s) => State::PollingProposal {
+                session: s,
+                pending_backoff: false,
+            },
+            SendSession::Closed(SessionOutcome::Success(psbt)) => {
+                let (tx, fee) = me.finalize(psbt)?;
+                me.result = Some((tx, fee));
+                State::Done
+            }
+            SendSession::Closed(outcome) => State::Failed(Some(Error::Payjoin(format!(
+                "session previously closed: {outcome:?}"
+            )))),
+        };
+        me.state = Some(state);
+        Ok(me)
     }
 
     /// The broadcastable transaction, once the session has reached `Step::Done`.

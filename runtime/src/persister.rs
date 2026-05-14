@@ -46,12 +46,10 @@ impl<E: Send + 'static> SessionPersister for Capturing<E> {
 /// pre-existing event sequence back into payjoin's state-machine constructors.
 ///
 /// `save_event` on this persister is a no-op — replay is read-only.
-#[allow(dead_code)] // wired up in the resume_from_events follow-up commit
 pub(crate) struct Replay<E> {
     pub(crate) events: Mutex<Option<Vec<E>>>,
 }
 
-#[allow(dead_code)]
 impl<E> Replay<E> {
     pub(crate) fn new(events: Vec<E>) -> Self {
         Self {

@@ -5,12 +5,13 @@ use std::sync::{Arc, Mutex};
 use bitcoin::{Psbt, Script, Transaction};
 use payjoin::persist::OptionalTransitionOutcome;
 use payjoin::receive::v2::{
-    Initialized, PayjoinProposal, Receiver, ReceiverBuilder, SessionEvent, UncheckedOriginalPayload,
+    replay_event_log, Initialized, PayjoinProposal, ReceiveSession, Receiver, ReceiverBuilder,
+    SessionEvent, SessionOutcome, UncheckedOriginalPayload,
 };
 use payjoin::receive::InputPair;
 use payjoin::ImplementationError;
 
-use crate::persister::Capturing;
+use crate::persister::{Capturing, Replay};
 use crate::{Error, FeeRange, Step};
 
 /// Wallet capabilities required by [`ReceiverSession`].
@@ -128,16 +129,55 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
     /// payjoin's state machine to reconstruct the receiver's current state, then
     /// continues from there.
     ///
-    /// Currently stubbed — see issue tracker.
+    /// # Atomic-persistence requirement
+    ///
+    /// Each `Step::Save` may carry multiple events that represent one logical
+    /// state advance (in particular, processing the sender's original PSBT
+    /// emits 9 events). They must be persisted **atomically as a batch**. If
+    /// the saved log ends partway through such a batch — e.g. it contains
+    /// `CheckedBroadcastSuitability` but not the subsequent events — this
+    /// function returns an error, since the state machine has no clean
+    /// re-entry point in the middle of `process_original`.
     pub fn resume_from_events(
-        _events: Vec<SessionEvent>,
-        _ohttp_relay: impl Into<String>,
-        _wallet: W,
-        _fee_range: FeeRange,
+        events: Vec<SessionEvent>,
+        ohttp_relay: impl Into<String>,
+        wallet: W,
+        fee_range: FeeRange,
     ) -> Result<Self, Error> {
-        Err(Error::Payjoin(
-            "resume_from_events is not yet implemented".into(),
-        ))
+        let persister = Replay::new(events);
+        let (session, history) =
+            replay_event_log(&persister).map_err(|e| Error::payjoin(format!("{e:?}")))?;
+        let pj_uri = history.pj_uri().to_string();
+
+        let state = match session {
+            ReceiveSession::Initialized(s) => State::Polling {
+                session: s,
+                pending_backoff: false,
+            },
+            ReceiveSession::PayjoinProposal(s) => State::Posting(s),
+            ReceiveSession::Closed(SessionOutcome::Success(_)) => State::Done,
+            ReceiveSession::Closed(outcome) => State::Failed(Some(Error::Payjoin(format!(
+                "session previously closed: {outcome:?}"
+            )))),
+            // Any other variant means the event log ended mid-`process_original`,
+            // violating the atomic-persistence requirement. We refuse to resume
+            // because the state machine has no clean re-entry point.
+            other => {
+                return Err(Error::Payjoin(format!(
+                    "cannot resume from intermediate state {other:?}; event log was not \
+                     persisted atomically per `Step::Save` batch"
+                )));
+            }
+        };
+
+        Ok(Self {
+            wallet,
+            fee_range,
+            ohttp_relay: ohttp_relay.into(),
+            pj_uri,
+            state: Some(state),
+            events: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     /// The BIP-21 / BIP-77 URI the receiver should share with the sender out of band.
