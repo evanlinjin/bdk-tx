@@ -283,6 +283,11 @@ async fn drive_receiver<W: ReceiverWallet>(
 ) -> Result<()> {
     loop {
         match session.poll() {
+            Step::Save(events) => {
+                // Production callers persist these atomically. The example
+                // doesn't need durability; we just log the count.
+                println!("[recv] would persist {} event(s)", events.len());
+            }
             Step::SendRequest(req) => {
                 let bytes = send(http, req).await?;
                 session.feed_response(bytes)?;
@@ -300,6 +305,9 @@ async fn drive_sender<W: SenderWallet>(
 ) -> Result<()> {
     loop {
         match session.poll() {
+            Step::Save(events) => {
+                println!("[send] would persist {} event(s)", events.len());
+            }
             Step::SendRequest(req) => {
                 let bytes = send(http, req).await?;
                 session.feed_response(bytes)?;

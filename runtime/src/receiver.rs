@@ -1,13 +1,16 @@
 //! Receiver-side high-level runtime.
 
+use std::sync::{Arc, Mutex};
+
 use bitcoin::{Psbt, Script, Transaction};
-use payjoin::persist::{NoopSessionPersister, OptionalTransitionOutcome};
+use payjoin::persist::OptionalTransitionOutcome;
 use payjoin::receive::v2::{
-    Initialized, PayjoinProposal, Receiver, ReceiverBuilder, UncheckedOriginalPayload,
+    Initialized, PayjoinProposal, Receiver, ReceiverBuilder, SessionEvent, UncheckedOriginalPayload,
 };
 use payjoin::receive::InputPair;
 use payjoin::ImplementationError;
 
+use crate::persister::Capturing;
 use crate::{Error, FeeRange, Step};
 
 /// Wallet capabilities required by [`ReceiverSession`].
@@ -50,12 +53,18 @@ pub trait ReceiverWallet {
 /// do next) and [`feed_response`](Self::feed_response) (consume the directory's
 /// reply). The session terminates with `Step::Done` after publishing the
 /// payjoin proposal back to the directory.
+///
+/// **Persistence.** Every internal payjoin state advance produces one
+/// `SessionEvent`. The runtime buffers events and surfaces them via
+/// [`Step::Save`]; the caller decides where/when/how to persist. To resume
+/// after a crash, replay the saved log via [`Self::resume_from_events`].
 pub struct ReceiverSession<W> {
     wallet: W,
     fee_range: FeeRange,
     ohttp_relay: String,
     pj_uri: String,
     state: Option<State>,
+    events: Arc<Mutex<Vec<SessionEvent>>>,
 }
 
 // Variants have naturally different sizes (an `Initialized` session is much
@@ -95,7 +104,8 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         wallet: W,
         fee_range: FeeRange,
     ) -> Result<Self, Error> {
-        let persister = NoopSessionPersister::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let persister = Capturing::new(events.clone());
         let session = builder.build().save(&persister).map_err(Error::payjoin)?;
         let pj_uri = session.pj_uri().to_string();
         Ok(Self {
@@ -107,7 +117,27 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
                 session,
                 pending_backoff: false,
             }),
+            events,
         })
+    }
+
+    /// Resume a session from a previously-persisted event log.
+    ///
+    /// `events` should be the complete sequence of session events as they were
+    /// recorded from [`Step::Save`], in order. The runtime replays them through
+    /// payjoin's state machine to reconstruct the receiver's current state, then
+    /// continues from there.
+    ///
+    /// Currently stubbed — see issue tracker.
+    pub fn resume_from_events(
+        _events: Vec<SessionEvent>,
+        _ohttp_relay: impl Into<String>,
+        _wallet: W,
+        _fee_range: FeeRange,
+    ) -> Result<Self, Error> {
+        Err(Error::Payjoin(
+            "resume_from_events is not yet implemented".into(),
+        ))
     }
 
     /// The BIP-21 / BIP-77 URI the receiver should share with the sender out of band.
@@ -121,7 +151,14 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
     }
 
     /// Advance the state machine and report what the caller should do next.
-    pub fn poll(&mut self) -> Step {
+    pub fn poll(&mut self) -> Step<SessionEvent> {
+        // Drain any captured events first — the caller must persist them
+        // before we issue any further side-effecting requests.
+        let drained = self.drain_events();
+        if !drained.is_empty() {
+            return Step::Save(drained);
+        }
+
         let state = match self.state.take() {
             Some(s) => s,
             None => return Step::Failed(Error::Terminated),
@@ -140,7 +177,19 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         Ok(())
     }
 
-    fn step(&self, state: State) -> (State, Step) {
+    fn drain_events(&self) -> Vec<SessionEvent> {
+        self.events
+            .lock()
+            .expect("captured-events mutex poisoned")
+            .drain(..)
+            .collect()
+    }
+
+    fn persister(&self) -> Capturing<SessionEvent> {
+        Capturing::new(self.events.clone())
+    }
+
+    fn step(&self, state: State) -> (State, Step<SessionEvent>) {
         match state {
             State::Polling {
                 session,
@@ -182,7 +231,7 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
     fn consume(&self, state: State, bytes: Vec<u8>) -> State {
         match state {
             State::AwaitingPoll { session, ctx } => {
-                let persister = NoopSessionPersister::default();
+                let persister = self.persister();
                 let outcome = match session.process_response(&bytes, ctx).save(&persister) {
                     Ok(o) => o,
                     Err(e) => return State::Failed(Some(Error::payjoin(e))),
@@ -211,7 +260,7 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         &self,
         unchecked: Receiver<UncheckedOriginalPayload>,
     ) -> Result<Receiver<PayjoinProposal>, Error> {
-        let persister = NoopSessionPersister::default();
+        let persister = self.persister();
         let wallet = &self.wallet;
 
         let p = unchecked

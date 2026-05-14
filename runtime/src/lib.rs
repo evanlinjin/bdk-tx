@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 
 mod error;
+mod persister;
 mod psbt;
 mod receiver;
 mod sender;
@@ -42,17 +43,29 @@ pub use sender::{SenderSession, SenderWallet};
 
 // Re-exports so consumers can build the runtime's inputs without a direct
 // `payjoin` dependency.
-pub use payjoin::receive::v2::ReceiverBuilder;
+pub use payjoin::receive::v2::{ReceiverBuilder, SessionEvent as ReceiverSessionEvent};
 pub use payjoin::receive::InputPair;
-pub use payjoin::send::v2::SenderBuilder;
+pub use payjoin::send::v2::{SenderBuilder, SessionEvent as SenderSessionEvent};
 pub use payjoin::{ImplementationError, OhttpKeys, PjUri, Request, Uri, UriExt};
 
 use bitcoin::FeeRate;
 
 /// Output of [`ReceiverSession::poll`] / [`SenderSession::poll`] — what the
 /// caller should do to drive the state machine forward.
+///
+/// `E` is the role's `SessionEvent` type
+/// ([`ReceiverSessionEvent`] / [`SenderSessionEvent`]).
 #[derive(Debug)]
-pub enum Step {
+pub enum Step<E> {
+    /// Persist these session events atomically before continuing. The events
+    /// represent one logical state advance (typically a `feed_response` ran
+    /// the receiver's 5-stage check ceremony, producing several events in
+    /// sequence). Save them in order, then call `poll` again.
+    ///
+    /// If the session crashes after `Save` is emitted but before the caller
+    /// persists, the session can be recovered by replaying the previously
+    /// saved log via `resume_from_events`.
+    Save(Vec<E>),
     /// Send this HTTP request, then feed the response body back via
     /// `feed_response`.
     SendRequest(Request),
