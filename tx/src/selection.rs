@@ -12,7 +12,12 @@ use rand_core::RngCore;
 
 use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
 
-const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+/// Default fallback sequence used by [`PsbtParams::default`].
+///
+/// RBF is enabled and the locktime is *not* required to be in the future. This matches
+/// what modern wallets and payjoin senders want: RBF-able by default. Override via
+/// [`PsbtParams::fallback_sequence`] if you need locktime-only semantics.
+const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
 
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
@@ -37,6 +42,14 @@ pub struct PsbtParams {
     pub fallback_locktime: absolute::LockTime,
 
     /// [`Sequence`] value to use by default if not provided by the input.
+    ///
+    /// Defaults to [`Sequence::ENABLE_RBF_NO_LOCKTIME`] so transactions built by
+    /// [`Selection::create_psbt`] are RBF-able out of the box. This is the right choice
+    /// for most callers (including payjoin senders, where the original PSBT must be
+    /// replaceable). Override to [`Sequence::ENABLE_LOCKTIME_NO_RBF`] (or another value)
+    /// when you specifically need locktime semantics without RBF.
+    ///
+    /// [`Selection::create_psbt`]: crate::Selection::create_psbt
     pub fallback_sequence: Sequence,
 
     /// Whether to require the full tx, aka [`non_witness_utxo`] for segwit v0 inputs,

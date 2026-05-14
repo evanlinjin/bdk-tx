@@ -5,7 +5,7 @@ use core::fmt;
 
 use bitcoin::constants::COINBASE_MATURITY;
 use bitcoin::transaction::OutputsIndexError;
-use bitcoin::{absolute, psbt, relative, Amount, Sequence, Txid};
+use bitcoin::{absolute, psbt, relative, Amount, Sequence, TxIn, Txid, Weight};
 use miniscript::bitcoin;
 use miniscript::bitcoin::{OutPoint, Transaction, TxOut};
 use miniscript::plan::Plan;
@@ -19,7 +19,7 @@ pub struct ConfirmationStatus {
     ///
     /// If this is `None` and the input has a relative time-based lock, timelock
     /// checking methods ([`Input::is_time_timelocked`], [`Input::is_timelocked`],
-    /// [`Input::is_spendable`]) will return `None` to indicate the lock status
+    /// [`Input::try_is_spendable`]) will return `None` to indicate the lock status
     /// cannot be determined.
     pub prev_mtp: Option<absolute::Time>,
 }
@@ -471,13 +471,33 @@ impl Input {
 
     /// Whether this output can be spent at the given height and mtp time.
     ///
+    /// Returns `None` if the spendability cannot be determined — i.e. if the input has a
+    /// relative time-based lock but [`ConfirmationStatus::prev_mtp`] or `tip_mtp` is not
+    /// available. For a plain `bool`, see [`Input::is_spendable`].
+    ///
     /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
-    pub fn is_spendable(
+    pub fn try_is_spendable(
         &self,
         tip_height: absolute::Height,
         tip_mtp: Option<absolute::Time>,
     ) -> Option<bool> {
         Some(!self.is_immature(tip_height) && !self.is_timelocked(tip_height, tip_mtp)?)
+    }
+
+    /// Whether this output can be spent at the given height and mtp time.
+    ///
+    /// Returns `false` when spendability is unknowable (see [`Input::try_is_spendable`]).
+    /// This is the right choice for most coin-selection filters: an input we cannot prove
+    /// to be spendable should not be considered. Use [`Input::try_is_spendable`] if you
+    /// need to distinguish "definitely not spendable" from "cannot tell".
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_spendable(
+        &self,
+        tip_height: absolute::Height,
+        tip_mtp: Option<absolute::Time>,
+    ) -> bool {
+        self.try_is_spendable(tip_height, tip_mtp).unwrap_or(false)
     }
 
     /// Absolute timelock.
@@ -498,12 +518,69 @@ impl Input {
     /// The weight in witness units needed for satisfying the [`Input`].
     ///
     /// The satisfaction weight is the combined size of the fully satisfied input's witness
-    /// and scriptSig expressed in weight units. See <https://en.bitcoin.it/wiki/Weight_units>.
+    /// and scriptSig expressed in weight units. This is the witness portion only; for the
+    /// total input weight (including the txin base), see [`Input::expected_input_weight`].
+    ///
+    /// See <https://en.bitcoin.it/wiki/Weight_units>.
     pub fn satisfaction_weight(&self) -> u64 {
         self.plan
             .satisfaction_weight()
             .try_into()
             .expect("usize must fit into u64")
+    }
+
+    /// The total weight contributed by spending this input in a transaction.
+    ///
+    /// Equal to the segwit-empty txin base weight (32 byte outpoint + 4 byte vout + 1
+    /// byte scriptSig length + 4 byte sequence = 41 bytes × 4 = 164 weight units) plus
+    /// [`Input::satisfaction_weight`].
+    ///
+    /// Use this when handing the input to a counterparty's transaction builder that
+    /// needs the input's exact weight contribution. For example, payjoin's
+    /// `InputPair::new` requires an explicit weight for unsigned P2TR or P2WSH inputs
+    /// because their witness data cannot be inferred from script type alone.
+    pub fn expected_input_weight(&self) -> Weight {
+        Weight::from_wu(TxIn::default().segwit_weight().to_wu() + self.satisfaction_weight())
+    }
+
+    /// Build a `(TxIn, psbt::Input)` pair populated with this input's spending plan
+    /// and previous-output information.
+    ///
+    /// The returned `psbt::Input` includes the witness and/or non-witness UTXO,
+    /// taproot key origins, and any other plan-derived fields. The returned `TxIn`
+    /// uses [`Input::sequence`] if the plan pins one (e.g. a relative timelock),
+    /// falling back to `fallback_sequence` otherwise.
+    ///
+    /// If this input was constructed from an already-finalized PSBT input
+    /// (see [`Input::from_psbt_input`]) the original `psbt::Input` is returned
+    /// unchanged and `fallback_sequence` is only applied to the wrapping `TxIn`.
+    ///
+    /// This is the same logic [`Selection::create_psbt`] runs internally and is
+    /// exposed for callers (payjoin sender/receiver, external coinjoin
+    /// coordinators, etc.) that need to hand a wallet input to a builder that
+    /// doesn't know how to satisfy it.
+    ///
+    /// [`Selection::create_psbt`]: crate::Selection::create_psbt
+    pub fn to_psbt_pair(&self, fallback_sequence: Sequence) -> (TxIn, psbt::Input) {
+        let txin = TxIn {
+            previous_output: self.prev_outpoint(),
+            sequence: self.sequence().unwrap_or(fallback_sequence),
+            ..Default::default()
+        };
+
+        if let Some(existing) = self.psbt_input() {
+            return (txin, existing.clone());
+        }
+
+        let mut psbt_input = psbt::Input::default();
+        if let Some(plan) = self.plan() {
+            plan.update_psbt_input(&mut psbt_input);
+            if plan.witness_version().is_some() {
+                psbt_input.witness_utxo = Some(self.prev_txout().clone());
+            }
+            psbt_input.non_witness_utxo = self.prev_tx().cloned();
+        }
+        (txin, psbt_input)
     }
 
     /// Is segwit.
@@ -595,18 +672,35 @@ impl InputGroup {
 
     /// Whether all contained inputs are spendable now.
     ///
+    /// Returns `None` if any input's spendability cannot be determined. For a plain
+    /// `bool`, see [`InputGroup::is_spendable`].
+    ///
     /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
-    pub fn is_spendable(
+    pub fn try_is_spendable(
         &self,
         tip_height: absolute::Height,
         tip_mtp: Option<absolute::Time>,
     ) -> Option<bool> {
         for input in &self.0 {
-            if !input.is_spendable(tip_height, tip_mtp)? {
+            if !input.try_is_spendable(tip_height, tip_mtp)? {
                 return Some(false);
             }
         }
         Some(true)
+    }
+
+    /// Whether all contained inputs are spendable now.
+    ///
+    /// Returns `false` when any input's spendability is unknowable (see
+    /// [`InputGroup::try_is_spendable`]).
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_spendable(
+        &self,
+        tip_height: absolute::Height,
+        tip_mtp: Option<absolute::Time>,
+    ) -> bool {
+        self.try_is_spendable(tip_height, tip_mtp).unwrap_or(false)
     }
 
     /// Returns the tx confirmation count this is the smallest in this group.

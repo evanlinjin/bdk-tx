@@ -65,6 +65,43 @@ impl Finalizer {
         }
     }
 
+    /// Build a finalizer by looking up plans for the inputs of an existing PSBT.
+    ///
+    /// `plan_for` is called for each input of the PSBT's unsigned transaction and
+    /// should return the [`Plan`] for inputs the caller intends to finalize. Inputs
+    /// for which `plan_for` returns `None` are left untouched by the resulting
+    /// finalizer.
+    ///
+    /// This is the typical entry point when the PSBT was built or modified by a
+    /// counterparty (e.g. a payjoin proposal) and the caller now needs to sign and
+    /// finalize their own inputs without rebuilding the [`Selection`].
+    ///
+    /// [`Selection`]: crate::Selection
+    pub fn from_psbt(psbt: &Psbt, mut plan_for: impl FnMut(OutPoint) -> Option<Plan>) -> Self {
+        let plans = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .filter_map(|txin| Some((txin.previous_output, plan_for(txin.previous_output)?)))
+            .collect();
+        Self { plans }
+    }
+
+    /// Attach plan-derived fields (bip32 derivations, taproot key origins, etc.) to
+    /// the matching PSBT inputs.
+    ///
+    /// Useful after receiving a PSBT that was sanitized by a counterparty: signers
+    /// generally need bip32/taproot origin metadata to pick the right private key.
+    /// Inputs whose outpoint is not in this finalizer are left untouched.
+    pub fn update_psbt(&self, psbt: &mut Psbt) {
+        for input_index in 0..psbt.inputs.len() {
+            let outpoint = psbt.unsigned_tx.input[input_index].previous_output;
+            if let Some(plan) = self.plans.get(&outpoint) {
+                plan.update_psbt_input(&mut psbt.inputs[input_index]);
+            }
+        }
+    }
+
     /// Finalize a PSBT input and return whether finalization was successful or input was already
     /// finalized.
     ///
