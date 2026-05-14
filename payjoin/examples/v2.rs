@@ -8,19 +8,19 @@
 
 use anyhow::{anyhow, Result};
 use bdk_payjoin::{
-    FeeRange, ImplementationError, OhttpKeys, ReceiverBuilder, ReceiverSession, ReceiverWallet,
+    input_pairs_from, restore_psbt_utxos, sign_and_finalize_with_plans, FeeRange,
+    ImplementationError, InputPair, OhttpKeys, ReceiverBuilder, ReceiverSession, ReceiverWallet,
     SenderSession, SenderWallet, Step, Uri, UriExt,
 };
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, ChangeScript, InputCandidates, Output, PsbtParams,
-    SelectorParams, Signer,
+    filter_unspendable, group_by_spk, ChangeScript, Output, PsbtParams, SelectorParams, Signer,
 };
 use bitcoin::{
-    consensus::encode::serialize_hex, key::Secp256k1, secp256k1::All, Amount, FeeRate, OutPoint,
-    Psbt, Script, Sequence, Transaction, Txid,
+    consensus::encode::serialize_hex, key::Secp256k1, secp256k1::All, Amount, FeeRate, Psbt, Script,
+    Sequence, Transaction, Txid,
 };
-use miniscript::{plan::Plan, Descriptor, DescriptorPublicKey};
+use miniscript::{Descriptor, DescriptorPublicKey};
 use payjoin::io::fetch_ohttp_keys;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::oneshot;
@@ -163,25 +163,30 @@ impl ReceiverWallet for RecvAdapter {
             .allowed)
     }
 
-    fn contribute(&self) -> Result<InputCandidates, bdk_payjoin::Error> {
+    fn contribute(&self) -> Result<Vec<InputPair>, bdk_payjoin::Error> {
         let (tip_height, tip_time) = self
             .wallet
             .tip_info(self.env.rpc_client())
             .map_err(|e| bdk_payjoin::Error::Wallet(e.to_string()))?;
-        Ok(self
+        let candidates = self
             .wallet
             .all_candidates()
-            .filter(|input| input.is_spendable(tip_height, Some(tip_time))))
+            .filter(|input| input.is_spendable(tip_height, Some(tip_time)));
+        Ok(input_pairs_from(&candidates, Sequence::ENABLE_RBF_NO_LOCKTIME))
     }
 
-    fn plan_of_output(&self, op: OutPoint) -> Option<Plan> {
-        self.wallet.plan_of_output(op, &self.wallet.assets())
-    }
-
-    fn sign(&self, psbt: &mut Psbt) -> Result<(), bdk_payjoin::Error> {
-        psbt.sign(&self.signer, &self.secp)
-            .map_err(|(_, errs)| bdk_payjoin::Error::Wallet(format!("sign: {errs:?}")))?;
-        Ok(())
+    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), bdk_payjoin::Error> {
+        let assets = self.wallet.assets();
+        sign_and_finalize_with_plans(
+            psbt,
+            |op| self.wallet.plan_of_output(op, &assets),
+            |psbt| {
+                psbt.sign(&self.signer, &self.secp).map_err(|(_, errs)| {
+                    bdk_payjoin::Error::Wallet(format!("sign: {errs:?}"))
+                })?;
+                Ok(())
+            },
+        )
     }
 }
 
@@ -240,22 +245,31 @@ struct SendAdapter {
 }
 
 impl SenderWallet for SendAdapter {
-    fn plan_of_output(&self, op: OutPoint) -> Option<Plan> {
-        self.wallet.plan_of_output(op, &self.wallet.assets())
-    }
-
-    fn prev_tx(&self, txid: Txid) -> Option<Transaction> {
-        self.wallet
-            .graph
-            .graph()
-            .get_tx(txid)
-            .map(|t| t.as_ref().clone())
-    }
-
-    fn sign(&self, psbt: &mut Psbt) -> Result<(), bdk_payjoin::Error> {
-        psbt.sign(&self.signer, &self.secp)
-            .map_err(|(_, errs)| bdk_payjoin::Error::Wallet(format!("sign: {errs:?}")))?;
-        Ok(())
+    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), bdk_payjoin::Error> {
+        let assets = self.wallet.assets();
+        // 1. Restore witness/non-witness UTXOs the proposal sanitized away.
+        restore_psbt_utxos(
+            psbt,
+            |op| self.wallet.plan_of_output(op, &assets).is_some(),
+            |txid| {
+                self.wallet
+                    .graph
+                    .graph()
+                    .get_tx(txid)
+                    .map(|t| t.as_ref().clone())
+            },
+        );
+        // 2 + 3. Sign and finalize the sender's inputs.
+        sign_and_finalize_with_plans(
+            psbt,
+            |op| self.wallet.plan_of_output(op, &assets),
+            |psbt| {
+                psbt.sign(&self.signer, &self.secp).map_err(|(_, errs)| {
+                    bdk_payjoin::Error::Wallet(format!("sign: {errs:?}"))
+                })?;
+                Ok(())
+            },
+        )
     }
 }
 

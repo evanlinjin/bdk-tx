@@ -6,25 +6,20 @@ rust-version = "1.85.0"
 homepage = "https://bitcoindevkit.org"
 repository = "https://github.com/bitcoindevkit/bdk-tx"
 documentation = "https://docs.rs/bdk_payjoin"
-description = "Glue between bdk_tx and the payjoin crate."
+description = "bdk_tx ergonomics for the payjoin_runtime sans-IO state machines."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+payjoin_runtime = { version = "0.1.0", path = "../runtime" }
 bdk_tx = { version = "0.1.0", path = "../tx", default-features = false }
-# Use payjoin's default features (`v2`). The runtime stores `ohttp::ClientResponse`
-# values across state transitions, so we need the same `ohttp` impl payjoin uses
-# (`bitcoin-ohttp` aliased to `ohttp`).
-payjoin = "1.0.0-rc.2"
-ohttp = { package = "bitcoin-ohttp", version = "0.6.0" }
-bitcoin = { version = "0.32", default-features = false }
 miniscript = { version = "12.3.5", default-features = false }
+bitcoin = { version = "0.32", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"
 bdk_testenv = "0.13.0"
 bdk_bitcoind_rpc = "0.20.0"
 bdk_chain = { version = "0.23.0" }
-miniscript = { version = "12.3.5", default-features = false }
 payjoin = { version = "1.0.0-rc.2", features = ["v2", "io"], default-features = false }
 url = { version = "2.5.7", features = ["serde"] }
 tokio = { version = "1.47.1", features = ["full"] }
@@ -37,8 +32,9 @@ std = ["bdk_tx/std"]
 [[example]]
 name = "v2"
 
-# The `common` module shared by examples. Renamed via `path` so the cargo example
-# target doesn't collide with `bdk_tx`'s identically-named `common` example artifact.
+# The `common` module shared by examples. Renamed via `path` so the cargo
+# example target doesn't collide with `bdk_tx`'s identically-named `common`
+# example artifact.
 [[example]]
 name = "payjoin_common"
 path = "examples/common.rs"

@@ -1,23 +1,22 @@
 //! Receiver-side high-level runtime.
 
-use bdk_tx::{Finalizer, InputCandidates};
-use bitcoin::{OutPoint, Psbt, Script, Sequence, Transaction};
-use miniscript::plan::Plan;
+use bitcoin::{Psbt, Script, Transaction};
 use payjoin::persist::{NoopSessionPersister, OptionalTransitionOutcome};
 use payjoin::receive::v2::{
     Initialized, PayjoinProposal, Receiver, ReceiverBuilder, UncheckedOriginalPayload,
 };
+use payjoin::receive::InputPair;
 use payjoin::ImplementationError;
 
-use crate::{input_pair_from, Error, FeeRange, Step};
+use crate::{Error, FeeRange, Step};
 
 /// Wallet capabilities required by [`ReceiverSession`].
 ///
 /// Implementors expose the four wallet-aware decisions the receiver makes:
 /// SPK ownership, broadcast suitability of the sender's original transaction,
-/// candidate inputs to contribute, and signing of the proposal PSBT. The runtime
-/// drives everything else — typestate transitions, polling, the 5-stage check
-/// ceremony, finalization.
+/// the set of inputs to contribute, and signing of the proposal PSBT. The
+/// runtime drives everything else — typestate transitions, polling, the
+/// 5-stage check ceremony, finalization.
 pub trait ReceiverWallet {
     /// Is the given script-pubkey owned by this wallet?
     ///
@@ -26,37 +25,29 @@ pub trait ReceiverWallet {
     /// claim outputs the proposal pays us).
     fn is_owned(&self, spk: &Script) -> bool;
 
-    /// Decide whether the sender's original transaction would be accepted by mempool
-    /// policy. Typically a `testmempoolaccept` RPC call.
+    /// Decide whether the sender's original transaction would be accepted by
+    /// mempool policy. Typically a `testmempoolaccept` RPC call.
     fn check_broadcast(&self, tx: &Transaction) -> Result<bool, ImplementationError>;
 
-    /// Produce the candidate inputs the receiver may contribute to the payjoin.
+    /// Produce the inputs to contribute to the payjoin, already shaped as
+    /// payjoin [`InputPair`]s.
     ///
-    /// The runtime will hand them to payjoin's `try_preserving_privacy` to pick
-    /// one in a privacy-preserving manner. Build the candidates however you like
-    /// (e.g. `Wallet::all_candidates().filter(...)` today, or via
-    /// `bdk_chain::CanonicalView` once that lands).
-    fn contribute(&self) -> Result<InputCandidates, Error>;
+    /// Bridge crates (e.g. `bdk_payjoin`) typically provide a helper to build
+    /// these from a wallet's candidate set in one line.
+    fn contribute(&self) -> Result<Vec<InputPair>, Error>;
 
-    /// Look up the spending plan for an outpoint we own. Used during proposal
-    /// finalization to know how to satisfy each contributed input.
-    fn plan_of_output(&self, op: OutPoint) -> Option<Plan>;
-
-    /// Sign the PSBT in place. The runtime handles finalization separately, so
-    /// implementors only need to add signatures.
-    fn sign(&self, psbt: &mut Psbt) -> Result<(), Error>;
-
-    /// Sequence to apply to contributed inputs whose plan does not pin one.
-    /// Defaults to [`Sequence::ENABLE_RBF_NO_LOCKTIME`] (BIP-125 RBF, no locktime).
-    fn fallback_sequence(&self) -> Sequence {
-        Sequence::ENABLE_RBF_NO_LOCKTIME
-    }
+    /// Sign and finalize this wallet's contributed inputs in the proposal PSBT.
+    ///
+    /// The sender's inputs in the same PSBT will remain unsigned — that's
+    /// expected. The proposal round-trips back to the sender, who completes
+    /// the remaining signatures before broadcast.
+    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), Error>;
 }
 
 /// Sans-IO state machine for the payjoin v2 receiver role.
 ///
-/// Drive by alternating [`poll`](Self::poll) (gives you a [`Step`] — what to do
-/// next) and [`feed_response`](Self::feed_response) (consume the directory's
+/// Drive by alternating [`poll`](Self::poll) (gives you a [`Step`] — what to
+/// do next) and [`feed_response`](Self::feed_response) (consume the directory's
 /// reply). The session terminates with `Step::Done` after publishing the
 /// payjoin proposal back to the directory.
 pub struct ReceiverSession<W> {
@@ -67,9 +58,9 @@ pub struct ReceiverSession<W> {
     state: Option<State>,
 }
 
-// Variants have naturally different sizes (an `Initialized` session is much smaller
-// than a fully-constructed `PayjoinProposal`), and at most one variant is ever
-// stored at once, so boxing each variant gains nothing.
+// Variants have naturally different sizes (an `Initialized` session is much
+// smaller than a fully-constructed `PayjoinProposal`), and at most one variant
+// is ever stored at once, so boxing each gains nothing.
 #[allow(clippy::large_enum_variant)]
 enum State {
     /// Need to GET-poll the directory for the sender's original PSBT.
@@ -92,18 +83,12 @@ enum State {
     AwaitingPostAck,
     /// Terminal success.
     Done,
-    /// Terminal failure. The optional `Error` is reported once via the next
-    /// `poll` call and then replaced with `None` (subsequent calls report
-    /// [`Error::Terminated`]).
+    /// Terminal failure.
     Failed(Option<Error>),
 }
 
 impl<W: ReceiverWallet> ReceiverSession<W> {
     /// Build a new session.
-    ///
-    /// The `builder` is already configured with the receiver's address, the
-    /// directory URL, and the OHTTP keys; we just finalize it. `ohttp_relay` is
-    /// the OHTTP CONNECT proxy through which every request is encapsulated.
     pub fn new(
         builder: ReceiverBuilder,
         ohttp_relay: impl Into<String>,
@@ -131,9 +116,6 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
     }
 
     /// Consume the session and return the wallet adapter.
-    ///
-    /// Useful for recovering ownership of the wallet after the session terminates
-    /// (e.g. to sync against the broadcast transaction).
     pub fn into_wallet(self) -> W {
         self.wallet
     }
@@ -150,8 +132,7 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
     }
 
     /// Feed back the body of the directory response from the most recent
-    /// `Step::SendRequest`. After this returns the caller should call `poll`
-    /// again.
+    /// `Step::SendRequest`.
     pub fn feed_response(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         let state = self.state.take().ok_or(Error::Terminated)?;
         let next = self.consume(state, bytes);
@@ -251,12 +232,7 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
             .map_err(Error::payjoin)?;
         let p = p.commit_outputs().save(&persister).map_err(Error::payjoin)?;
 
-        let candidates = wallet.contribute()?;
-        let fb_seq = wallet.fallback_sequence();
-        let inputs: Vec<_> = candidates
-            .inputs()
-            .filter_map(|i| input_pair_from(i, fb_seq))
-            .collect();
+        let inputs = wallet.contribute()?;
         if inputs.is_empty() {
             return Err(Error::Wallet("no candidate inputs to contribute".into()));
         }
@@ -278,16 +254,9 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         let p = p
             .finalize_proposal(|psbt: &Psbt| {
                 let mut psbt = psbt.clone();
-                let f = Finalizer::from_psbt(&psbt, |op| wallet.plan_of_output(op));
-                f.update_psbt(&mut psbt);
                 wallet
-                    .sign(&mut psbt)
+                    .process_psbt(&mut psbt)
                     .map_err(|e| ImplementationError::from(e.to_string().as_str()))?;
-                // `finalize` here only resolves the receiver's contributed inputs; the
-                // sender's inputs remain unfinalized on purpose and will be signed by
-                // the sender after the proposal round-trips. `is_finalized()` would be
-                // false at this point, but that's expected — don't treat it as an error.
-                let _ = f.finalize(&mut psbt);
                 Ok(psbt)
             })
             .save(&persister)

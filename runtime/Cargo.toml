@@ -1,0 +1,17 @@
+[package]
+name = "payjoin_runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+homepage = "https://bitcoindevkit.org"
+repository = "https://github.com/bitcoindevkit/bdk-tx"
+documentation = "https://docs.rs/payjoin_runtime"
+description = "Sans-IO state machines for the payjoin v2 protocol."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+payjoin = "1.0.0-rc.2"
+# We hold `ohttp::ClientResponse` values across state transitions, so we need
+# the same `ohttp` impl payjoin uses (`bitcoin-ohttp` aliased to `ohttp`).
+ohttp = { package = "bitcoin-ohttp", version = "0.6.0" }
+bitcoin = { version = "0.32", default-features = false }

@@ -1,30 +1,32 @@
 //! Sender-side high-level runtime.
 
-use bdk_tx::Finalizer;
-use bitcoin::{Amount, FeeRate, OutPoint, Psbt, Transaction, Txid};
-use miniscript::plan::Plan;
+use bitcoin::{Amount, FeeRate, Psbt, Transaction};
 use payjoin::persist::{NoopSessionPersister, OptionalTransitionOutcome};
 use payjoin::send::v2::{PollingForProposal, Sender, SenderBuilder, WithReplyKey};
 use payjoin::PjUri;
 
-use crate::{psbt::restore_psbt_utxos, Error, Step};
+use crate::{Error, Step};
 
 /// Wallet capabilities required by [`SenderSession`].
 ///
-/// The sender's only wallet-aware operations are looking up our own inputs in
-/// the proposal PSBT and signing them. The runtime owns the rest of the flow.
+/// The sender's only wallet-aware operation is processing the payjoin proposal
+/// PSBT: restoring any sanitized UTXO fields, signing the sender's inputs, and
+/// finalizing the PSBT for extraction. The runtime drives everything else.
 pub trait SenderWallet {
-    /// Look up the spending plan for an outpoint we own. Used to drive
-    /// finalization on the proposal PSBT.
-    fn plan_of_output(&self, op: OutPoint) -> Option<Plan>;
-
-    /// Look up a previous transaction we have on hand. Used to restore the
-    /// `non_witness_utxo` / `witness_utxo` fields that the payjoin proposal
-    /// sanitizes away.
-    fn prev_tx(&self, txid: Txid) -> Option<Transaction>;
-
-    /// Sign the PSBT in place. The runtime handles finalization and extraction.
-    fn sign(&self, psbt: &mut Psbt) -> Result<(), Error>;
+    /// Process the proposal PSBT in place.
+    ///
+    /// The implementation is responsible for three things, in order:
+    /// 1. Restoring `witness_utxo` / `non_witness_utxo` on the sender's inputs
+    ///    if the proposal sanitized them away (see [`restore_psbt_utxos`]).
+    /// 2. Signing the sender's inputs.
+    /// 3. Finalizing every input (the receiver should already have finalized
+    ///    theirs; this call finalizes the sender's). After this returns, the
+    ///    runtime calls `psbt.extract_tx()`, so the PSBT must be fully ready.
+    ///
+    /// Bridge crates typically provide a one-call helper that does all three.
+    ///
+    /// [`restore_psbt_utxos`]: crate::restore_psbt_utxos
+    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), Error>;
 }
 
 /// Sans-IO state machine for the payjoin v2 sender role.
@@ -40,8 +42,7 @@ pub struct SenderSession<W> {
     result: Option<(Transaction, Amount)>,
 }
 
-// See the note on `receiver::State`. Sender state variants similarly vary in size
-// (`PostingOriginal` vs. `Done`) but only one exists at a time.
+// See the note on `receiver::State`.
 #[allow(clippy::large_enum_variant)]
 enum State {
     /// Need to POST the original PSBT to the directory.
@@ -63,7 +64,7 @@ enum State {
     },
     /// Terminal success.
     Done,
-    /// Terminal failure. See [`crate::receiver`] for the optional-error convention.
+    /// Terminal failure.
     Failed(Option<Error>),
 }
 
@@ -214,18 +215,10 @@ impl<W: SenderWallet> SenderSession<W> {
 
     fn finalize(&self, mut psbt: Psbt) -> Result<(Transaction, Amount), Error> {
         let fee = psbt.fee().map_err(Error::payjoin)?;
-        restore_psbt_utxos(
-            &mut psbt,
-            |op| self.wallet.plan_of_output(op),
-            |txid| self.wallet.prev_tx(txid),
-        );
-        let f = Finalizer::from_psbt(&psbt, |op| self.wallet.plan_of_output(op));
-        f.update_psbt(&mut psbt);
-        self.wallet.sign(&mut psbt)?;
-        if !f.finalize(&mut psbt).is_finalized() {
-            return Err(Error::FinalizeFailed);
-        }
-        let tx = psbt.extract_tx().map_err(Error::payjoin)?;
+        self.wallet.process_psbt(&mut psbt)?;
+        let tx = psbt
+            .extract_tx()
+            .map_err(|e| Error::Wallet(format!("extract_tx after process_psbt: {e}")))?;
         Ok((tx, fee))
     }
 }

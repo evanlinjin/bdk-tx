@@ -1,86 +1,46 @@
-//! High-level sans-IO runtime for the payjoin v2 protocol, integrated with `bdk_tx`.
+//! `bdk_tx` ergonomics for the [`payjoin_runtime`] sans-IO state machines.
 //!
-//! `bdk_payjoin` exposes a driver per role ([`ReceiverSession`], [`SenderSession`])
-//! that owns the multi-stage payjoin typestate, the OHTTP polling cycle, and the
-//! `.save(&persister)` ceremony. The caller drives each session by exchanging
-//! [`Request`] / response bytes with their preferred HTTP transport and supplies
-//! wallet-aware decisions through the [`ReceiverWallet`] / [`SenderWallet`] traits.
+//! This crate re-exports the runtime and adds a small set of helpers that
+//! convert `bdk_tx`-flavored values into the shapes the runtime traits expect:
 //!
-//! # Sketch
+//! - [`input_pair_from`] / [`input_pairs_from`]: turn `bdk_tx::Input`s into
+//!   payjoin [`InputPair`]s, handling the P2TR / P2WSH weight quirk.
+//! - [`sign_and_finalize_with_plans`]: implement a wallet's `process_psbt`
+//!   method using `bdk_tx::Finalizer` and a `plan_of_output` lookup.
+//!
+//! The runtime itself depends only on `payjoin`, `bitcoin`, and `bitcoin-ohttp`;
+//! the `bdk_tx` integration is opt-in via this crate.
 //!
 //! ```ignore
-//! let mut session = ReceiverSession::new(builder, relay, wallet, fee_range)?;
-//! loop {
-//!     match session.poll() {
-//!         Step::SendRequest(req) => {
-//!             let resp = http.post(req).await?;
-//!             session.feed_response(resp.bytes().to_vec())?;
-//!         }
-//!         Step::Backoff => sleep(Duration::from_secs(2)).await,
-//!         Step::Done => break,
-//!         Step::Failed(e) => return Err(e.into()),
+//! use bdk_payjoin::{
+//!     input_pairs_from, sign_and_finalize_with_plans, ReceiverSession, ReceiverWallet,
+//! };
+//! # struct MyWallet;
+//! impl ReceiverWallet for MyWallet {
+//!     // ... is_owned, check_broadcast ...
+//!
+//!     fn contribute(&self) -> Result<Vec<bdk_payjoin::InputPair>, bdk_payjoin::Error> {
+//!         let candidates = todo!("build bdk_tx::InputCandidates");
+//!         Ok(input_pairs_from(&candidates, bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME))
+//!     }
+//!
+//!     fn process_psbt(&self, psbt: &mut bitcoin::Psbt) -> Result<(), bdk_payjoin::Error> {
+//!         sign_and_finalize_with_plans(
+//!             psbt,
+//!             |op| todo!("look up plan for op"),
+//!             |psbt| todo!("sign psbt with your signer"),
+//!         )
 //!     }
 //! }
 //! ```
-//!
-//! For users who want to drive the payjoin state machine manually, the lower-level
-//! glue ([`input_pair_from`], [`input_pairs_from`], [`restore_psbt_utxos`]) is also
-//! exposed.
 
 #![warn(missing_docs)]
 
-mod error;
-mod psbt;
-mod receiver;
-mod sender;
+pub use payjoin_runtime::*;
 
-pub use error::Error;
-pub use psbt::restore_psbt_utxos;
-pub use receiver::{ReceiverSession, ReceiverWallet};
-pub use sender::{SenderSession, SenderWallet};
-
-// Re-exports for callers so they don't need to depend on `payjoin` directly.
-pub use payjoin::receive::v2::ReceiverBuilder;
-pub use payjoin::send::v2::SenderBuilder;
-pub use payjoin::{ImplementationError, OhttpKeys, PjUri, Request, Uri, UriExt};
-
-use bdk_tx::{Input, InputCandidates};
-use bitcoin::{FeeRate, Sequence};
-use payjoin::receive::InputPair;
-
-/// Output of [`ReceiverSession::poll`] / [`SenderSession::poll`] — what the
-/// caller should do to drive the state machine forward.
-#[derive(Debug)]
-pub enum Step {
-    /// Send this HTTP request, then feed the response body back via
-    /// `feed_response`.
-    SendRequest(Request),
-    /// The directory had no payload yet. Sleep, then call `poll` again. The
-    /// runtime never enforces a specific delay — pick what's appropriate for
-    /// your context (a few seconds is conventional).
-    Backoff,
-    /// The session reached its terminal success state. For the sender, the
-    /// finalized transaction is now available via
-    /// [`SenderSession::final_tx`](crate::SenderSession::final_tx).
-    Done,
-    /// The session failed terminally. Subsequent `poll` calls will return
-    /// [`Error::Terminated`].
-    Failed(Error),
-}
-
-/// Fee-range bounds passed by the receiver to payjoin's `apply_fee_range`.
-///
-/// Both endpoints are optional: `None` for `min` means "accept payjoin's
-/// recommended minimum (broadcast-min)"; `None` for `max` means "the receiver
-/// will not pay for any of the network fee".
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FeeRange {
-    /// Minimum effective feerate the receiver accepts on the proposal.
-    pub min: Option<FeeRate>,
-    /// Maximum effective feerate the receiver is willing to pay for their own
-    /// contributed input/output. `None` opts out of receiver-paid fees.
-    pub max: Option<FeeRate>,
-}
+use bdk_tx::{Finalizer, Input, InputCandidates};
+use bitcoin::{OutPoint, Psbt, Sequence};
+use miniscript::plan::Plan;
 
 /// Convert a single [`Input`] into a payjoin [`InputPair`].
 ///
@@ -96,23 +56,63 @@ pub struct FeeRange {
 ///
 /// Returns `None` if payjoin rejects the input (e.g. the script type is
 /// unsupported, the prev_tx / witness_utxo are missing, etc.).
-pub fn input_pair_from(input: &Input, fallback_sequence: Sequence) -> Option<InputPair> {
+///
+/// [`InputPair`]: payjoin_runtime::InputPair
+/// [`InputPair::new`]: payjoin_runtime::InputPair::new
+pub fn input_pair_from(
+    input: &Input,
+    fallback_sequence: Sequence,
+) -> Option<payjoin_runtime::InputPair> {
     let spk = &input.prev_txout().script_pubkey;
     let needs_explicit_weight = spk.is_p2tr() || spk.is_p2wsh();
     let expected_weight = needs_explicit_weight.then(|| input.expected_input_weight());
     let (txin, psbt_input) = input.to_psbt_pair(fallback_sequence);
-    InputPair::new(txin, psbt_input, expected_weight).ok()
+    payjoin_runtime::InputPair::new(txin, psbt_input, expected_weight).ok()
 }
 
 /// Convert every input in `candidates` into a payjoin [`InputPair`].
 ///
 /// Inputs that payjoin rejects are silently dropped.
+///
+/// [`InputPair`]: payjoin_runtime::InputPair
 pub fn input_pairs_from(
     candidates: &InputCandidates,
     fallback_sequence: Sequence,
-) -> Vec<InputPair> {
+) -> Vec<payjoin_runtime::InputPair> {
     candidates
         .inputs()
         .filter_map(|input| input_pair_from(input, fallback_sequence))
         .collect()
+}
+
+/// Implement a wallet's `process_psbt` method using `bdk_tx::Finalizer` and a
+/// per-outpoint plan lookup.
+///
+/// This is the typical adapter for both [`ReceiverWallet::process_psbt`] and
+/// [`SenderWallet::process_psbt`]:
+/// 1. Build a [`Finalizer`] for outpoints we own.
+/// 2. Re-attach plan-derived fields (bip32 / taproot origins) to those PSBT
+///    inputs.
+/// 3. Call `sign` to add signatures.
+/// 4. Finalize the inputs we own.
+///
+/// The `sign` closure is just `psbt.sign(&signer, &secp)` in most callers; we
+/// don't take it directly so callers can pass their preferred error mapping.
+///
+/// For the **sender** call site, you'll typically pair this with
+/// [`payjoin_runtime::restore_psbt_utxos`] before signing — the proposal often
+/// strips `witness_utxo` / `non_witness_utxo` that the signer needs.
+///
+/// [`ReceiverWallet::process_psbt`]: payjoin_runtime::ReceiverWallet::process_psbt
+/// [`SenderWallet::process_psbt`]: payjoin_runtime::SenderWallet::process_psbt
+pub fn sign_and_finalize_with_plans(
+    psbt: &mut Psbt,
+    plan_for: impl Fn(OutPoint) -> Option<Plan>,
+    sign: impl FnOnce(&mut Psbt) -> Result<(), payjoin_runtime::Error>,
+) -> Result<(), payjoin_runtime::Error> {
+    let finalizer = Finalizer::from_psbt(psbt, plan_for);
+    finalizer.update_psbt(psbt);
+    sign(psbt)?;
+    let _ = finalizer.finalize(psbt);
+    Ok(())
 }
