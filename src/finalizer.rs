@@ -1,4 +1,7 @@
 use crate::collections::{BTreeMap, HashMap};
+use core::fmt;
+
+use bitcoin::psbt::PsbtSighashType;
 use bitcoin::{OutPoint, Psbt, Witness};
 use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 
@@ -11,6 +14,13 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 /// the pre-computed spending [`Plan`] for each input. This process converts a PSBT input from a
 /// partially signed state to a fully signed state, making it ready for extraction into a valid
 /// Bitcoin [`Transaction`].
+///
+/// # BIP174 compliance
+///
+/// As required by [BIP174], finalization fails for any input whose declared sighash type
+/// (`PSBT_IN_SIGHASH_TYPE`) disagrees with one of its signatures (see
+/// [`FinalizeError::SighashType`]). When clearing the now-redundant per-input metadata, the UTXO
+/// and any unknown or proprietary key-value pairs are preserved.
 ///
 /// # Usage
 ///
@@ -70,17 +80,22 @@ impl Finalizer {
     ///
     /// # Errors
     ///
-    /// If the spending plan associated with the PSBT input cannot be satisfied,
-    /// then a [`miniscript::Error`] is returned.
+    /// - [`FinalizeError::SighashType`] if the input declares a sighash type via
+    ///   `PSBT_IN_SIGHASH_TYPE` and one of its signatures uses a different type. As mandated by
+    ///   [BIP174], a finalizer must reject such inputs.
+    /// - [`FinalizeError::Satisfy`] if the spending plan associated with the PSBT input cannot be
+    ///   satisfied with the data present in the PSBT.
     ///
     /// # Panics
     ///
     /// - If `input_index` is outside the bounds of the PSBT input vector.
+    ///
+    /// [BIP174]: <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer>
     pub fn finalize_input(
         &self,
         psbt: &mut Psbt,
         input_index: usize,
-    ) -> Result<bool, miniscript::Error> {
+    ) -> Result<bool, FinalizeError> {
         // return true if already finalized.
         {
             let psbt_input = &psbt.inputs[input_index];
@@ -97,13 +112,20 @@ impl Finalizer {
             .expect("index out of range")
             .previous_output;
         if let Some(plan) = self.plans.get(&outpoint) {
+            // BIP174: a finalizer must reject inputs carrying a signature whose sighash type does
+            // not match the type declared by `PSBT_IN_SIGHASH_TYPE`.
+            check_sighash_types(&psbt.inputs[input_index])?;
+
             let stfr = PsbtInputSatisfier::new(psbt, input_index);
             let (stack, script) = plan.satisfy(&stfr)?;
-            // clearing all fields and setting back the utxo, final scriptsig and witness
+            // Clear all fields, restoring only what BIP174 says a finalizer must keep: the UTXO,
+            // the unknown and proprietary key-value pairs, and the final scriptSig and witness.
             let original = core::mem::take(&mut psbt.inputs[input_index]);
             let psbt_input = &mut psbt.inputs[input_index];
             psbt_input.non_witness_utxo = original.non_witness_utxo;
             psbt_input.witness_utxo = original.witness_utxo;
+            psbt_input.unknown = original.unknown;
+            psbt_input.proprietary = original.proprietary;
             if !script.is_empty() {
                 psbt_input.final_script_sig = Some(script);
             }
@@ -148,7 +170,7 @@ impl Finalizer {
 
 /// Holds the results of finalization
 #[derive(Debug)]
-pub struct FinalizeMap(BTreeMap<usize, Result<bool, miniscript::Error>>);
+pub struct FinalizeMap(BTreeMap<usize, Result<bool, FinalizeError>>);
 
 impl FinalizeMap {
     /// Whether all inputs were finalized
@@ -157,17 +179,130 @@ impl FinalizeMap {
     }
 
     /// Get the results as a map of `input_index` to `finalize_input` result.
-    pub fn results(self) -> BTreeMap<usize, Result<bool, miniscript::Error>> {
+    pub fn results(self) -> BTreeMap<usize, Result<bool, FinalizeError>> {
         self.0
     }
+}
+
+/// Error returned when finalizing a PSBT input.
+#[derive(Debug, PartialEq)]
+pub enum FinalizeError {
+    /// One of the input's signatures uses a sighash type that disagrees with the input's declared
+    /// `PSBT_IN_SIGHASH_TYPE`.
+    ///
+    /// [BIP174] requires finalizers to fail in this case rather than produce a transaction whose
+    /// signatures commit to a different sighash type than was declared.
+    ///
+    /// [BIP174]: <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer>
+    SighashType(SighashTypeMismatch),
+    /// The input's spending [`Plan`] could not be satisfied with the data present in the PSBT.
+    ///
+    /// [`Plan`]: miniscript::plan::Plan
+    Satisfy(miniscript::Error),
+}
+
+impl fmt::Display for FinalizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SighashType(e) => write!(f, "{e}"),
+            Self::Satisfy(e) => write!(f, "failed to satisfy spending plan: {e}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for FinalizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SighashType(e) => Some(e),
+            Self::Satisfy(e) => Some(e),
+        }
+    }
+}
+
+impl From<SighashTypeMismatch> for FinalizeError {
+    fn from(e: SighashTypeMismatch) -> Self {
+        Self::SighashType(e)
+    }
+}
+
+impl From<miniscript::Error> for FinalizeError {
+    fn from(e: miniscript::Error) -> Self {
+        Self::Satisfy(e)
+    }
+}
+
+/// A signature in a PSBT input uses a sighash type that disagrees with the input's declared
+/// `PSBT_IN_SIGHASH_TYPE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SighashTypeMismatch {
+    /// The sighash type declared by the input's `PSBT_IN_SIGHASH_TYPE` field.
+    pub declared: PsbtSighashType,
+    /// The sighash type found on the offending signature.
+    pub found: PsbtSighashType,
+}
+
+impl fmt::Display for SighashTypeMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "signature sighash type ({}) does not match the input's declared sighash type ({})",
+            self.found, self.declared,
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SighashTypeMismatch {}
+
+/// Verify that every signature present in `psbt_input` uses the sighash type declared by the
+/// input's `PSBT_IN_SIGHASH_TYPE` field.
+///
+/// If the input does not declare a sighash type there is nothing to enforce, so this returns
+/// `Ok(())`. BIP174 only requires finalizers to reject signatures that disagree with a *declared*
+/// type; an undeclared type leaves signers free to choose.
+fn check_sighash_types(psbt_input: &bitcoin::psbt::Input) -> Result<(), SighashTypeMismatch> {
+    let declared = match psbt_input.sighash_type {
+        Some(declared) => declared,
+        None => return Ok(()),
+    };
+
+    // Both `EcdsaSighashType` and `TapSighashType` map onto a `PsbtSighashType`, so comparing the
+    // raw `u32` representation works uniformly across signature kinds. For Taproot this naturally
+    // captures the BIP-encoded distinction between 64-byte (implicit `SIGHASH_DEFAULT`) and
+    // 65-byte (explicit trailing sighash byte) signatures.
+    let check = |found: PsbtSighashType| -> Result<(), SighashTypeMismatch> {
+        if found.to_u32() == declared.to_u32() {
+            Ok(())
+        } else {
+            Err(SighashTypeMismatch { declared, found })
+        }
+    };
+
+    for sig in psbt_input.partial_sigs.values() {
+        check(sig.sighash_type.into())?;
+    }
+    if let Some(sig) = &psbt_input.tap_key_sig {
+        check(sig.sighash_type.into())?;
+    }
+    for sig in psbt_input.tap_script_sigs.values() {
+        check(sig.sighash_type.into())?;
+    }
+
+    Ok(())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use crate::{Finalizer, Output, PsbtParams, Selection, Signer};
+    use crate::{
+        FinalizeError, Finalizer, Output, PsbtParams, Selection, SighashTypeMismatch, Signer,
+    };
+    use bitcoin::psbt::raw;
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn, TxOut};
+    use bitcoin::{
+        absolute, transaction, Amount, EcdsaSighashType, ScriptBuf, TapSighashType, TxIn, TxOut,
+    };
     use miniscript::bitcoin;
     use miniscript::bitcoin::Transaction;
     use miniscript::plan::Assets;
@@ -415,6 +550,161 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(psbt.inputs[0].final_script_sig, final_script_sig);
         assert_eq!(psbt.inputs[0].final_script_witness, final_script_witness);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_rejects_taproot_sighash_type_mismatch() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        // Sign without a declared sighash type, producing a 64-byte `SIGHASH_DEFAULT` signature.
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        // Now declare a conflicting sighash type. The finalizer must refuse to finalize.
+        psbt.inputs[0].sighash_type = Some(TapSighashType::All.into());
+
+        let err = finalizer
+            .finalize_input(&mut psbt, 0)
+            .expect_err("finalization must fail on sighash mismatch");
+        assert_eq!(
+            err,
+            FinalizeError::SighashType(SighashTypeMismatch {
+                declared: TapSighashType::All.into(),
+                found: TapSighashType::Default.into(),
+            })
+        );
+
+        // The input must be left untouched (not finalized).
+        assert!(psbt.inputs[0].final_script_sig.is_none());
+        assert!(psbt.inputs[0].final_script_witness.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_rejects_ecdsa_sighash_type_mismatch() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(WPKH_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        // Sign without a declared sighash type, producing a `SIGHASH_ALL` signature.
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        // Declare a conflicting sighash type.
+        psbt.inputs[0].sighash_type = Some(EcdsaSighashType::Single.into());
+
+        let err = finalizer
+            .finalize_input(&mut psbt, 0)
+            .expect_err("finalization must fail on sighash mismatch");
+        assert_eq!(
+            err,
+            FinalizeError::SighashType(SighashTypeMismatch {
+                declared: EcdsaSighashType::Single.into(),
+                found: EcdsaSighashType::All.into(),
+            })
+        );
+
+        assert!(psbt.inputs[0].final_script_sig.is_none());
+        assert!(psbt.inputs[0].final_script_witness.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_accepts_matching_declared_sighash_type() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        // Declare `SIGHASH_DEFAULT` up front. (`SIGHASH_DEFAULT` keeps the 64-byte signature size
+        // assumed by the plan; a 65-byte sighash would need a plan built for that size.)
+        let params = PsbtParams {
+            sighash_type: Some(TapSighashType::Default.into()),
+            ..Default::default()
+        };
+        let mut psbt = selection.create_psbt(params)?;
+        let finalizer = selection.into_finalizer();
+        assert_eq!(
+            psbt.inputs[0].sighash_type,
+            Some(TapSighashType::Default.into())
+        );
+
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        // The declared type matches the signature, so the sighash check passes and the input
+        // finalizes.
+        assert!(finalizer.finalize_input(&mut psbt, 0)?);
+        assert!(psbt.inputs[0].final_script_witness.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_preserves_unknown_and_proprietary_fields() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        // Attach unknown and proprietary metadata that BIP174 says a finalizer must preserve.
+        let unknown_key = raw::Key {
+            type_value: 0x77,
+            key: vec![0xaa, 0xbb],
+        };
+        psbt.inputs[0]
+            .unknown
+            .insert(unknown_key.clone(), vec![1u8, 2, 3]);
+        let prop_key = raw::ProprietaryKey {
+            prefix: b"bdk".to_vec(),
+            subtype: 0u8,
+            key: vec![0x01],
+        };
+        psbt.inputs[0]
+            .proprietary
+            .insert(prop_key.clone(), vec![4u8, 5, 6]);
+
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        // Taproot metadata is present before finalization.
+        assert!(!psbt.inputs[0].tap_key_origins.is_empty());
+        assert!(psbt.inputs[0].tap_internal_key.is_some());
+
+        assert!(finalizer.finalize_input(&mut psbt, 0)?);
+        assert!(psbt.inputs[0].final_script_witness.is_some());
+
+        // Non-essential signing metadata is cleared.
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
+        assert!(psbt.inputs[0].tap_key_origins.is_empty());
+        assert!(psbt.inputs[0].tap_internal_key.is_none());
+
+        // Unknown and proprietary fields survive.
+        assert_eq!(
+            psbt.inputs[0].unknown.get(&unknown_key),
+            Some(&vec![1u8, 2, 3])
+        );
+        assert_eq!(
+            psbt.inputs[0].proprietary.get(&prop_key),
+            Some(&vec![4u8, 5, 6])
+        );
 
         Ok(())
     }
